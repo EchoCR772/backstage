@@ -44,38 +44,59 @@ class Session {
     this.closed = false;
   }
 
-  // specs: [{ key, path, index }]; reader: { size(path), read(path, start, end) }
+  // specs: [{ key, path, index, offset?, from?, to? }]; reader: { size(path), read(path, start, end) }
+  // An added sound plays file time `from`..`to`; file time = clip time + offset.
   static async open(specs, reader) {
     const s = new Session();
-    const byPath = new Map();
+    s.reader = reader;
+    s.byPath = new Map();
     try {
-      for (const sp of specs) {
-        let entry = byPath.get(sp.path);
-        if (!entry) {
-          const input = new Input({
-            formats: ALL_FORMATS,
-            source: new CustomSource({
-              getSize: () => reader.size(sp.path),
-              read: (a, b) => reader.read(sp.path, a, b),
-              prefetchProfile: 'fileSystem',
-            }),
-          });
-          s.inputs.push(input);
-          entry = { tracks: await input.getAudioTracks() };
-          byPath.set(sp.path, entry);
-        }
-        const tr = entry.tracks[sp.index];
-        if (!tr || !(await tr.canDecode())) continue;
-        const gain = s.ctx.createGain();
-        gain.gain.value = 0;
-        gain.connect(s.master);
-        s.tracks.set(sp.key, { sink: new AudioBufferSink(tr), gain });
-      }
+      for (const sp of specs) await s.add(sp);
     } catch (e) {
       s.close();
       throw e;
     }
     return s;
+  }
+  async add(sp) {
+    let entry = this.byPath.get(sp.path);
+    if (!entry) {
+      const reader = this.reader;
+      const input = new Input({
+        formats: ALL_FORMATS,
+        source: new CustomSource({
+          getSize: () => reader.size(sp.path),
+          read: (a, b) => reader.read(sp.path, a, b),
+          prefetchProfile: 'fileSystem',
+        }),
+      });
+      this.inputs.push(input);
+      entry = { tracks: await input.getAudioTracks() };
+      this.byPath.set(sp.path, entry);
+    }
+    const tr = entry.tracks[sp.index || 0];
+    if (this.closed || !tr || !(await tr.canDecode())) return false;
+    const gain = this.ctx.createGain();
+    gain.gain.value = 0;
+    gain.connect(this.master);
+    const t = { sink: new AudioBufferSink(tr), gain, offset: sp.offset || 0, from: sp.from ?? null, to: sp.to ?? null };
+    this.tracks.set(sp.key, t);
+    if (this.playing) this.pump(t, this.gen, Math.max(0, this.time));
+    return true;
+  }
+  remove(key) {
+    const t = this.tracks.get(key);
+    if (!t) return;
+    t.dead = true;
+    try { t.gain.disconnect(); } catch (e) { /* ignore */ }
+    this.tracks.delete(key);
+  }
+  // where an added sound sits changed: play on from here with the new placement
+  setWindow(key, w) {
+    const t = this.tracks.get(key);
+    if (!t) return;
+    Object.assign(t, w);
+    if (this.playing) { const at = this.audible; this.playing = false; this.halt(); this.play(at); }
   }
 
   has(key) { return this.tracks.has(key); }
@@ -128,20 +149,28 @@ class Session {
   }
 
   async pump(t, gen, pos) {
+    const off = t.offset || 0, from = t.from, to = t.to;
+    const fpos = Math.max(from ?? 0, pos + off);
+    if (to != null && fpos >= to) return;
     try {
-      for await (const { buffer, timestamp } of t.sink.buffers(pos)) {
-        if (gen !== this.gen) return;
-        const when = this.startCtx + (timestamp - this.pos);
+      for await (const { buffer, timestamp } of t.sink.buffers(fpos)) {
+        if (gen !== this.gen || t.dead) return;
+        if (to != null && timestamp >= to) return;
+        // only the part of the buffer inside the sound's window
+        const skip = from != null && timestamp < from ? from - timestamp : 0;
+        const len = (to != null ? Math.min(buffer.duration, to - timestamp) : buffer.duration) - skip;
+        if (len <= 0) continue;
+        const when = this.startCtx + (timestamp + skip - off - this.pos);
         const now = this.ctx.currentTime;
         const node = this.ctx.createBufferSource();
         node.buffer = buffer;
         node.connect(t.gain);
-        if (when >= now) node.start(when);
-        else if (now - when < buffer.duration) node.start(now, now - when); // late: skip what already passed
+        if (when >= now) node.start(when, skip, len);
+        else if (now - when < len) node.start(now, skip + now - when, len - (now - when)); // late: skip what already passed
         else { node.disconnect(); continue; }
         this.nodes.add(node);
         node.onended = () => this.nodes.delete(node);
-        while (gen === this.gen && timestamp - this.time > AHEAD) await sleep(60);
+        while (gen === this.gen && timestamp - off - this.time > AHEAD) await sleep(60);
         if (gen !== this.gen) return;
       }
     } catch (e) {

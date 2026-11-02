@@ -307,6 +307,8 @@ body.resizing *{user-select:none}
 .modal-x:hover{color:#fff;background:#2a292e}
 .modal-x .ico{width:20px;height:20px}
 .modal-btns{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.modal.choice{width:500px}
+.modal-btns.n3{grid-template-columns:1fr 1fr 1.2fr;gap:10px}
 .mbtn{height:42px;border:0;border-radius:8px;background:#2a292e;color:#fff;font:inherit;font-size:15px;font-weight:600;cursor:pointer;transition:background .15s ease}
 .mbtn:hover{background:#343338}
 .mbtn.danger{background:#da373c}
@@ -488,7 +490,7 @@ body.dropping .drop-card{transform:none}
 .drop-title{font-size:22px;font-weight:800}
 .drop-sub{font-size:13px;opacity:.85}
 
-/* ---------- the clip editor (Discord's clip editor) ---------- */
+/* ---------- the editor (started from Discord's clip editor) ---------- */
 #qt{position:fixed;left:0;right:0;bottom:0;top:40px;z-index:20;background:rgba(0,0,0,0);display:flex;align-items:center;justify-content:center;padding:18px 22px;transition:background .16s ease}
 #qt[hidden]{display:none}
 #qt.on{background:rgba(0,0,0,.72)}
@@ -497,7 +499,6 @@ body.dropping .drop-card{transform:none}
 .qt-box .ibtn{color:#b5b4ba}
 .qt-box .ibtn:hover:not(:disabled){color:#fff;background:var(--qt-card2)}
 /* top bar: clip arrows, title, tools */
-.qt-nav{display:flex;gap:2px;flex:none}
 .qt-titles{flex:1;min-width:0}
 .qt-titlerow{display:flex;min-width:0}
 .qt-title{display:inline-flex;align-items:center;gap:8px;max-width:100%;min-width:0;padding:2px 6px;margin-left:-6px;border:0;border-radius:6px;background:transparent;color:#fff;font:inherit;font-size:16px;font-weight:600;cursor:pointer;text-align:left;transition:color .15s ease}
@@ -557,12 +558,6 @@ body.dropping .drop-card{transform:none}
 /* side panel */
 .qt-side h4{margin:12px 0 8px;font-size:13px;font-weight:600;color:#fff}
 .qt-card{background:var(--qt-card);border:1px solid var(--qt-line);border-radius:9px;padding:10px}
-.qt-info{display:flex;align-items:center;gap:10px}
-#qtthumb{width:54px;height:32px;border-radius:5px;overflow:hidden;background:#000;flex:none}
-#qtthumb img{width:100%;height:100%;object-fit:cover;display:block}
-.qt-infotext{min-width:0}
-#qtname{font-size:13px;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;user-select:text}
-#qtmeta{font-size:11.5px;color:var(--mute);margin-top:2px}
 .qt-trim{display:grid;grid-template-columns:auto 1fr;gap:8px 10px;align-items:center}
 .qt-trim label{color:var(--mute);font-size:13px}
 .qt-t{width:100%;background:#0f0f12;border:1px solid var(--qt-line);border-radius:6px;padding:5px 8px;font:inherit;font-size:13px;color:#fff;text-align:center;font-variant-numeric:tabular-nums;user-select:text;outline:none}
@@ -781,3 +776,292 @@ button:focus-visible,.clip:focus-visible{outline:2px solid var(--acc);outline-of
 /* the card being dragged out of the app lifts away and stays faded until the drag ends */
 .clip{transition:border-color .2s,box-shadow .2s,transform .18s var(--ease),opacity .18s ease}
 .clip.lifted{transform:scale(.96);opacity:.45}
+
+/* ---------- the editor page: Trim (quick) and Edit (full timeline) ----------
+   Every size and colour the two levels use is here, so a restyle changes one place. */
+#qt{left:var(--sidew,260px);padding:0;background:#000;display:block;transition:none}
+#qt.on{background:#000}
+.qt-box{
+  --qtclips:var(--qtclipsw,250px); --qtclipsmini:96px; --qtside:330px; --qttl:330px;
+  --etl-bg:#050506; --etl-lane:#0c0c0f; --etl-line:#151518; --etl-head:118px;
+  --etl-row:34px; --etl-clip:58px; --etl-snd:40px; --etl-zh:15px;
+  --etl-vol:#f0b232; --etl-ph:#f23f43; --etl-clipc:#4a4a56; --etl-on:#25253a;
+  --as-tile:#1a191c; --as-line:#2e2d31;
+  max-width:none;max-height:none;border:0;border-radius:0;box-shadow:none;opacity:1;transform:none;transition:none;
+  grid-template-columns:var(--qtclips) minmax(0,1fr) var(--qtside);grid-template-rows:minmax(0,1fr) auto;
+  grid-template-areas:"clips main side" "tl tl tl"}
+.qt-box.mini{--qtclips:var(--qtclipsmini)}
+.qt-box>.qt-clips{grid-area:clips}.qt-box>.qt-main{grid-area:main}.qt-box>.qt-side{grid-area:side}.qt-box>.etl{grid-area:tl}
+/* what each level shows */
+.qt-box.trim .etl,.qt-box.trim .qt-tools,.qt-box.trim #qttrim-btn,.qt-box.trim #qtgamepick,.qt-box.trim .qt-assets,
+.qt-box.trim #qtfxpropsh,.qt-box.trim #qtfxprops{display:none}
+.qt-box.edit #qttl,.qt-box.edit #qtedit-btn,.qt-box.edit #qtclipstitle,.qt-box.edit .qt-clips:not(.tab-clips) .qt-clipshead{display:none}
+/* Edit: clicking the open tab in the sidebar folds the panel away */
+.qt-box.edit.nopanel{--qtclips:0px}
+.qt-box.edit.nopanel>.qt-clips{display:none}
+.qt-box:not(.edit) .qt-saving,.qt-box.edit:not(.manual) .qt-saving,.qt-box.edit.manual #qttrim-btn{display:none}
+.qt-box.edit .qt-clips:not(.tab-clips) .qt-listwrap,.qt-box.edit .qt-clips.tab-clips .qt-assets{display:none}
+#qt.fxsel .qt-box.edit .qt-clipprops{display:none}
+/* the clip list: part of the sidebar (it narrows to pictures when the sidebar collapses) */
+.qt-clips{position:relative;display:flex;flex-direction:column;min-height:0;min-width:0;border-right:1px solid var(--qt-line);background:#000}
+.qt-clipshead{display:flex;align-items:center;padding:14px 14px 8px;min-width:0}
+.qt-clipstitle{flex:1;min-width:0;font-weight:700;color:#fff;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.qt-listwrap{position:relative;flex:1;min-height:0;display:flex;overflow:hidden}
+.qt-cliplist{--qc-padx:10px;--qc-gap:10px;--qc-top:2px;flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;position:relative}
+.qc-space{width:1px;pointer-events:none}
+.qt-cliplist .clip{position:absolute;aspect-ratio:auto}
+.qt-cliplist .clip.on{border-color:var(--acc);box-shadow:0 0 0 1px var(--acc)}
+.qt-box.mini .qt-clipshead,.qt-box.mini #qtclipsgrip{display:none}
+.qt-box.mini .qt-cliplist{--qc-padx:8px;--qc-gap:8px;--qc-top:12px}
+.qt-box.mini .qt-cliplist .clip{border-radius:8px}
+.qt-box.mini .qt-cliplist .clip>:not(img):not(video):not(.ph){display:none}
+/* the clip list's cards: the home card's layout, sized for the column (no seek bar; the Copy
+   button comes back with the card redesign) */
+.clip.lc{border-radius:10px}
+.clip.lc .hbar,.clip.lc .cchk,.clip.lc .cact .cbtn:nth-child(2){display:none}
+.clip.lc .cbottom,.clip.lc:hover .cbottom{transform:none;padding:0 10px 8px}
+.clip.lc .shade2,.clip.lc:hover .shade2{height:60%}
+.clip.lc .ckind{left:7px;top:7px;font-size:10.5px;line-height:18px;gap:5px}
+.clip.lc .csrc{width:18px;height:18px}
+.clip.lc:hover .ckind{transform:none}
+.clip.lc .cact{right:6px;top:6px}
+.clip.lc .ctitle{font-size:13px;margin-bottom:2px}
+.clip.lc .csubrow{height:16px;gap:8px}
+.clip.lc .csub{font-size:11px}
+.clip.lc .cdur{font-size:11.5px}
+.clip.lc .cfile{font-size:10.5px;height:14px}
+.qt-vgrip{position:absolute;top:0;bottom:0;right:-4px;width:8px;cursor:ew-resize;z-index:6}
+.qt-vgrip.left{left:-4px;right:auto}
+.qt-side{position:relative}
+/* back to the top: slides down over a list once it's scrolled */
+.totop{position:absolute;left:50%;z-index:8;width:34px;height:34px;margin-left:-17px;border:1px solid #2e2d31;border-radius:50%;background:#1a191c;color:#e2e1e4;
+  display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.6);transform:translateY(-60px);opacity:0;pointer-events:none;
+  transition:transform .22s cubic-bezier(.2,.8,.2,1),opacity .18s ease}
+.totop.show{transform:none;opacity:1;pointer-events:auto}
+.totop:hover{background:#242327;color:#fff}
+.totop .ico{width:16px;height:16px}
+#libside,#libmain{position:relative}
+/* header: Edit / Back to Trim */
+.qt-head .qt-mode{flex:none}
+#qtedit-btn.has{border-color:var(--acc)}
+.qt-saving{display:flex;gap:8px;flex:none}
+#qtsave-btn.dirty::after{content:"";width:6px;height:6px;border-radius:50%;background:#fff;margin-left:2px}
+#qtedit-btn.has::after{content:"";width:6px;height:6px;border-radius:50%;background:var(--acc);margin-left:2px}
+/* Edit: the picture tools under the player */
+.qt-tools{align-self:center;display:flex;align-items:center;gap:2px;margin-top:10px;padding:3px;flex:none;background:var(--as-tile);border:1px solid var(--as-line);border-radius:9px}
+.qt-tool{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 10px;border:0;border-radius:6px;background:transparent;color:#b5b4ba;font:inherit;font-size:12.5px;cursor:pointer;white-space:nowrap}
+.qt-tool .ico{width:16px;height:16px}
+.qt-tool:hover{background:var(--qt-card2);color:#fff}
+.qt-tool.on{background:var(--etl-on);color:#fff}
+/* Edit: the asset panel */
+.qt-box.edit .qt-clipshead{padding:12px 10px 10px}
+.as-title{font-weight:700;color:#fff;font-size:15px;margin:2px 2px 12px}
+.qt-assets{flex:1;min-height:0;overflow-y:auto;padding:12px}
+.as-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.as-grid.one{grid-template-columns:1fr}
+.as-tile{height:72px;min-width:0;border-radius:8px;border:1px solid var(--as-line);background:var(--as-tile);color:#e2e1e4;font:inherit;font-size:12.5px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;cursor:pointer;padding:0 6px}
+.as-tile:hover{border-color:#46454c;background:#212024}
+.as-tile.on{border-color:var(--acc);background:#1f2038}
+.as-tile .ico{width:20px;height:20px}
+.as-name{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.as-sample{max-width:100%;overflow:hidden;white-space:nowrap;color:#fff}
+.ta-title .as-sample{font-weight:800;font-size:19px;-webkit-text-stroke:3px #000;paint-order:stroke fill}
+.ta-caption .as-sample{font-weight:500;font-size:13px;text-shadow:0 2px 4px #000}
+.ta-callout .as-sample{font-weight:800;font-size:16px;color:#f0b232;-webkit-text-stroke:3px #000;paint-order:stroke fill}
+.ta-plain .as-sample{font-size:12.5px;color:#e2e1e4}
+.as-hint{margin-top:12px;font-size:12px;line-height:1.45;color:#6b6a6f}
+/* the picture: a frame the crop's shape, the video moving inside it */
+.qt-stage{cursor:default}
+.qt-view{position:relative;flex:none;overflow:hidden;outline:1px solid #2a2a30;border-radius:6px;background:#000}
+.qt-stage .qt-view canvas,.qt-stage .qt-view video{position:absolute;border:0;border-radius:0;max-width:none;max-height:none;object-fit:fill;box-sizing:content-box}
+.qt-levels{position:absolute;inset:0;pointer-events:none}
+.qt-stage .qt-levels canvas.fx-level{left:0;top:0;width:100%;height:100%}
+.fx-blur{position:absolute}
+.qt-edit{position:absolute;inset:0;cursor:pointer}
+.qt-edit.tool-draw,.qt-edit.tool-crop{cursor:crosshair}
+.fx-selbox{position:absolute;border:1.5px solid var(--acc);box-shadow:0 0 0 1px rgba(0,0,0,.55);cursor:move}
+.fx-selbox.zoom{border:1.5px dashed #f0b232}
+.fx-cropbox{position:absolute;border:1.5px solid #fff;box-shadow:0 0 0 9999px rgba(0,0,0,.6);cursor:move}
+.fx-h{position:absolute;width:10px;height:10px;margin:-6px 0 0 -6px;background:#fff;border:1.5px solid var(--acc);border-radius:2px;z-index:2}
+.fx-h.nw{left:0;top:0;cursor:nwse-resize}.fx-h.ne{left:100%;top:0;cursor:nesw-resize}.fx-h.sw{left:0;top:100%;cursor:nesw-resize}.fx-h.se{left:100%;top:100%;cursor:nwse-resize}
+.fx-h.dot{border-radius:50%;cursor:move}
+.fx-guide{position:absolute;background:#eb459e;pointer-events:none;z-index:3}
+.fx-guide.v{top:0;bottom:0;width:1px}
+.fx-guide.h{left:0;right:0;height:1px}
+.qt-time{white-space:nowrap}
+.qt-time .qt-frame{margin-left:10px;color:var(--dim)}
+.qt-hgrip{height:10px;flex:none;cursor:ns-resize;position:relative}
+.qt-hgrip::after{content:"";position:absolute;left:50%;top:4px;width:36px;height:3px;margin-left:-18px;border-radius:2px;background:#2a2a30}
+.qt-hgrip:hover::after{background:#46454c}
+/* ---------- Edit: the timeline across the bottom ---------- */
+.etl{position:relative;display:flex;flex-direction:column;height:var(--qttl);min-height:200px;background:var(--etl-bg);border-top:1px solid var(--qt-line)}
+.etl .qt-hgrip{position:absolute;top:-6px;left:0;right:0;z-index:7}
+.etl-bar{display:flex;align-items:center;gap:10px;height:40px;flex:none;padding:0 10px;border-bottom:1px solid #1a191d}
+.etl-tools{flex:1;display:flex;align-items:center;gap:2px;min-width:0}
+.etl-sep{width:1px;height:18px;background:var(--as-line);margin:0 6px}
+.etl-time{margin-left:12px;font-size:12.5px;color:var(--mute);white-space:nowrap;font-variant-numeric:tabular-nums}
+.etl-time b{color:#fff;font-weight:600}
+.etl-transport{display:flex;align-items:center;gap:2px}
+.etl-zoom{flex:1;display:flex;align-items:center;justify-content:flex-end;gap:8px;color:var(--mute)}
+.etl-zoom>.ico{width:15px;height:15px}
+.etl-zoom input{width:130px}
+.etl .ibtn.on{background:var(--etl-on);color:#fff}
+.etl #etlsnap.on{color:var(--etl-vol)}
+.etl-ov{position:relative;height:12px;flex:none;margin:6px 14px 0 var(--etl-head);border-radius:3px;background:#141416;cursor:pointer}
+.etl-ovtrim{position:absolute;top:0;bottom:0;background:#26263a;border-radius:2px}
+.etl-ovwin{position:absolute;top:-1px;bottom:-1px;min-width:6px;border:1px solid var(--acc);border-radius:3px;background:rgba(88,101,242,.18);cursor:grab}
+.etl-ov.all .etl-ovwin{border-color:#33333c;background:transparent}
+.etl-ovph{position:absolute;top:0;bottom:0;width:2px;margin-left:-1px;background:var(--etl-ph);pointer-events:none}
+.etl-ruler{position:relative;height:22px;flex:none;margin:2px 14px 0 var(--etl-head);cursor:pointer;overflow:hidden}
+.etl-ruler .tick{position:absolute;bottom:0;width:1px;height:5px;background:#3a3940}
+.etl-ruler .tick.major{height:9px;background:#6b6a70}
+.etl-ruler .tlabel{position:absolute;top:1px;font-size:10.5px;color:var(--dim);transform:translateX(4px);white-space:nowrap;font-variant-numeric:tabular-nums}
+.etl-tracks{position:relative;flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;border-top:1px solid var(--etl-line)}
+.etl-ph{position:absolute;bottom:0;width:2px;margin-left:-1px;background:var(--etl-ph);pointer-events:none;z-index:6}
+.etl-ph::before{content:"";position:absolute;top:0;left:-5px;border:6px solid transparent;border-top-color:var(--etl-ph)}
+.trow{position:relative;display:flex;align-items:stretch;height:var(--etl-row);border-bottom:1px solid var(--etl-line)}
+.trow.v1{height:var(--etl-clip)}
+.trow.c,.trow.a{height:var(--etl-snd)}
+.trk-h{width:var(--etl-head);flex:none;display:flex;align-items:center;gap:6px;padding:0 4px 0 10px;min-width:0;background:#08080a}
+.trk-name{flex:none;font-size:11.5px;font-weight:600;color:#b5b4b9}
+.trk-sub{flex:1;min-width:0;font-size:11px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.trk-ib{width:22px;height:22px;flex:none;margin-left:auto}
+.trk-ib .ico{width:13px;height:13px}
+.trk-ib.off{color:var(--red)}
+.trk-l{position:relative;flex:1;min-width:0;margin-right:14px;background:var(--etl-lane);overflow:hidden}
+.trow.drop .trk-l{background:#16162a}
+.trk-empty{position:absolute;left:10px;top:50%;transform:translateY(-50%);font-size:11px;color:#46454c;pointer-events:none;white-space:nowrap}
+.trow.c.muted .trk-wave{opacity:.35}
+.trk-b{position:absolute;top:3px;bottom:3px;min-width:4px;border-radius:4px;background:color-mix(in srgb,var(--c) 38%,#101013);border:1px solid var(--c);overflow:hidden;cursor:grab;box-sizing:border-box}
+.trk-b.sel{box-shadow:0 0 0 1.5px #fff;z-index:2}
+.trk-b.off{opacity:.38}
+.trow.a .trk-b{background:color-mix(in srgb,var(--c) 22%,transparent)}
+.trk-b.cb{--c:var(--etl-clipc);background:transparent;cursor:pointer}
+.trk-b.cb .trk-eg{background:var(--c);width:7px}
+.trk-b.cb .trk-eg:hover,.trk-b.cb.sel .trk-eg{background:#c9c8d0}
+.trk-b.cb.sel{box-shadow:none;border-color:#c9c8d0}
+.trk-b.zb{top:2px;bottom:auto;height:var(--etl-zh);border-radius:3px;z-index:3}
+.trk-b.zb .trk-label{font-size:10px}
+.trk-label{position:absolute;left:9px;top:50%;transform:translateY(-50%);font-size:11px;color:#fff;white-space:nowrap;pointer-events:none;text-shadow:0 1px 2px #000}
+.trk-b.vb .trk-label{top:auto;bottom:4px;transform:none}
+.trk-thumbs{position:absolute;left:0;top:3px;width:100%;height:calc(100% - 6px);pointer-events:none}
+.trk-wave{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.trk-eg{position:absolute;top:0;bottom:0;width:6px;background:var(--c);cursor:ew-resize}
+.trk-eg.s,.trk-eg.ts{left:0}.trk-eg.e,.trk-eg.te{right:0}
+.trk-ease{position:absolute;top:0;bottom:0;background:rgba(255,255,255,.16);pointer-events:none}
+.trk-ease.in{left:0}.trk-ease.out{right:0}
+.trk-ease .trk-eg{pointer-events:auto;width:4px;background:#fff;opacity:.85}
+.trk-ease.in .trk-eg{left:auto;right:-2px}
+.trk-ease.out .trk-eg{right:auto;left:-2px}
+.trk-pt{position:absolute;width:9px;height:9px;margin:-4.5px 0 0 -4.5px;border-radius:50%;background:var(--etl-vol);border:1.5px solid #000;cursor:grab;z-index:4}
+.trk-shade{position:absolute;top:0;bottom:0;background:rgba(0,0,0,.66);pointer-events:none;z-index:1}
+.etl-tracks.razor .trk-l,.etl-tracks.razor .trk-b{cursor:crosshair}
+/* the selected effect's settings */
+.qt-fxprops{display:flex;flex-direction:column;gap:2px}
+.fx-prow{display:flex;align-items:center;gap:8px;margin:3px 0;flex-wrap:wrap}
+.fx-plabel{font-size:12.5px;color:var(--mute);min-width:64px}
+.fx-plabel.short{min-width:0}
+.fx-prow input[type=range]{flex:1;min-width:80px}
+.fx-pval{font-size:12px;color:var(--mute);min-width:36px;text-align:right;font-variant-numeric:tabular-nums}
+.fx-pval.wide{flex:1;text-align:left}
+.fx-chips{display:flex;flex-wrap:wrap;gap:4px;flex:1}
+.qt-fxprops .chip{padding:3px 9px;font-size:12px;border-radius:6px}
+.fx-swatches{display:flex;gap:5px;align-items:center;flex-wrap:wrap}
+.fx-sw{width:18px;height:18px;padding:0;border-radius:5px;border:1px solid #3a3940;cursor:pointer}
+.fx-sw.on{outline:2px solid #fff;outline-offset:1px}
+.fx-swpick{width:26px;height:20px;padding:0;border:0;background:none;cursor:pointer}
+.fx-text{width:100%;box-sizing:border-box;background:#0a090c;border:1px solid var(--qt-line);border-radius:7px;color:#fff;font:inherit;padding:6px 8px;resize:vertical;margin-bottom:4px}
+.fx-hint{font-size:12px;color:var(--dim);margin:2px 0 4px;line-height:1.45}
+.fx-times .qt-t{width:74px}
+.qt-addaudio{margin-top:6px;gap:6px}
+.qt-addaudio .ico{width:14px;height:14px}
+.qt-apts.on{color:#f0b232}
+.qt-arow.missing .qt-anametext{color:var(--red)}
+/* problem reports */
+.report-ta{width:100%;box-sizing:border-box;resize:vertical;font:inherit;margin-bottom:8px}
+.report-check{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--mute);margin:4px 0 6px}
+.report-note.warn{color:var(--red)}
+.rep{border:1px solid var(--line2);border-radius:9px;padding:10px 12px;margin-bottom:8px}
+.rep.new{border-color:var(--acc)}
+.rep-head{display:flex;align-items:center;gap:8px}
+.rep-head b{flex:1;color:#fff}
+.rep-state{font-size:11.5px;padding:1px 7px;border-radius:5px;background:#1f3a2a;color:#7fd8a1}
+.rep-state.closed{background:#2a2a30;color:var(--mute)}
+.rep-sub,.rep-none,.rep-when{font-size:12px;color:var(--dim);margin-top:2px}
+.rep-reply{margin-top:8px;padding:8px 10px;border-radius:7px;background:#141417}
+#appmenu.dot{position:relative}
+#appmenu.dot::after{content:"";position:absolute;right:5px;top:5px;width:7px;height:7px;border-radius:50%;background:var(--red)}
+
+/* ---------- finding a game: the sidebar's search and sort, Edit's tabs in the sidebar, the Clips picker ---------- */
+#gamesbar{flex:none;display:flex;align-items:center;gap:6px;height:44px;padding:0 10px 6px 16px}
+.gbar-ico{flex:none;display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;border:0;border-radius:50%;background:transparent;color:var(--mute);cursor:pointer;transition:color .15s ease,background .15s ease}
+.gbar-ico:hover{color:#fff;background:#1a191c}
+.gbar-ico .ico{width:18px;height:18px}
+#gsearch{flex:1;width:auto;min-width:0}
+.gsx{display:none;flex:none;align-items:center;justify-content:center;width:22px;height:22px;margin-right:-4px;border:0;border-radius:5px;background:transparent;color:var(--mute);cursor:pointer}
+.gsx:hover{color:#fff;background:#232227}
+.gsx .ico{width:14px;height:14px}
+/* open sidebar: a search box like the home page's (the clear button shows once there's text); the rail: just the button */
+#libside:not(.collapsed) .gbar-ico{display:none}
+#gsearch:has(input:not(:placeholder-shown)) .gsx{display:inline-flex}
+.gsort{margin-left:auto;flex:none;background:transparent;color:var(--mute);padding:6px 8px}
+.gsort:hover,.gsort.open{background:#1a191c;color:#fff}
+.gsort .ico{width:16px;height:16px}
+#libside.collapsed #gamesbar{justify-content:center;padding:0 0 4px}
+#libside.collapsed #gsearch,#libside.collapsed .gsort{display:none}
+#libside.collapsed .gbar-ico{width:48px;height:34px;border-radius:8px}
+.gempty{padding:14px 10px;color:var(--dim);font-size:13px;text-align:center}
+#libside.collapsed .gempty{display:none}
+
+#edittabs{display:none;flex:1;overflow-y:auto;overflow-x:hidden;padding:0 8px 12px}
+body.editlevel #edittabs{display:block}
+body.editlevel #games,body.editlevel #gamesbar,body.editlevel #sidefixed .allclips{display:none}
+.etab .gav.ico-av{background:#1a191c;color:#d9d8dc}
+.etab.on .gav.ico-av{color:#fff}
+.etab .elabel{display:none}
+#libside:not(.collapsed) .etab{min-height:64px}
+#libside.collapsed #edittabs{padding:4px 6px 12px}
+#libside.collapsed .etab{flex-direction:column;gap:4px;margin:0 0 10px}
+#libside.collapsed .etab .elabel{display:block;font-size:11px;font-weight:600;color:var(--mute);line-height:1;transition:color .15s ease}
+#libside.collapsed .etab:hover .elabel,#libside.collapsed .etab.on .elabel{color:#fff}
+
+.gpick{display:flex;align-items:center;gap:10px;width:100%;min-width:0;padding:7px 10px 7px 7px;border:0;border-radius:8px;background:#141317;color:var(--text);font:inherit;text-align:left;cursor:pointer;transition:background .15s ease}
+.gpick:hover,.gpick.open{background:#1f1e22}
+.gpick .gav{width:36px;height:36px;border-radius:6px;font-size:12px}
+.gpick .gav.ico-av .ico{width:18px;height:18px}
+.gpick .gname{font-size:14px}
+.gpick .gcount{font-size:12px}
+.gpick .chev{width:15px;height:15px;color:var(--mute);flex:none;transition:transform .15s ease}
+.gpick.open .chev{transform:rotate(180deg)}
+
+.gpicker{position:fixed;z-index:29;display:flex;flex-direction:column;background:#1a191c;border:1px solid var(--line2);border-radius:10px;box-shadow:0 12px 34px rgba(0,0,0,.6);overflow:hidden}
+.gp-top{display:flex;align-items:center;gap:6px;padding:8px;border-bottom:1px solid #26252a}
+.gp-top .search{flex:1;width:auto;height:34px;background:#0e0d10}
+.gp-top .search input{padding:0}
+.gpsort{width:34px;height:34px;color:var(--mute)}
+.gpsort:hover,.gpsort.open{color:#fff;background:#28272b}
+.gpsort .ico{width:17px;height:17px}
+.gp-list{flex:1;min-height:0;overflow-y:auto;padding:4px}
+.gp-row{display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:7px;cursor:pointer;color:var(--text)}
+.gp-row.hi{background:#28272b}
+.gp-row .gav{width:32px;height:32px;border-radius:6px;font-size:11px}
+.gp-row .gav.ico-av .ico{width:16px;height:16px}
+.gp-row .gname{font-size:14px}
+.gp-row .gcount{font-size:12px}
+.gp-row>.ico{width:16px;height:16px;color:var(--acc);flex:none}
+
+/* Edit: the timeline runs the whole width of the window, under the sidebar, which stops above it.
+   The editor page starts at the window's left edge with an empty column where the sidebar shows through. */
+body.editlevel #qt{left:0;background:transparent;pointer-events:none}
+body.editlevel #qt .qt-box{background:transparent;pointer-events:none;
+  grid-template-columns:var(--sidew,80px) var(--qtclips) minmax(0,1fr) var(--qtside);grid-template-areas:". clips main side" "tl tl tl tl"}
+body.editlevel #qt .qt-box>*{pointer-events:auto}
+body.editlevel #qt .qt-main,body.editlevel #qt .qt-side{background:#000}
+body.editlevel #libside{align-self:start;height:calc(100% - var(--qttlh,330px))}
+/* the tabs fit above the timeline in the rail; if the window is very short they scroll without a bar (no sideways shift) */
+#edittabs{scrollbar-width:none}
+#edittabs::-webkit-scrollbar{display:none}
+#libside.collapsed .etab{gap:3px;margin:0 0 6px;padding:0}
+#libside.collapsed .etab .gav{width:44px;height:44px}
+#ctxmenu[data-for="gsort"]{min-width:0}
+#ctxmenu[data-for="gsort"] button{padding-right:16px}

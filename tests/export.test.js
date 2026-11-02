@@ -36,7 +36,7 @@ const cleanDecode = f => { try { execFileSync('/usr/bin/ffmpeg', ['-v', 'error',
 
     // smart cut export: exact frames, length, clean joins
     await setTrim('2.5', '9.3');
-    const r1 = await w.evaluate(() => T.qtExport({ path: document.getElementById('qtname').title, start: 2.5, end: 9.3, as: 'video', dest: 'save', audio: {} }));
+    const r1 = await w.evaluate(() => T.qtExport({ path: window.qtActivePath(), start: 2.5, end: 9.3, as: 'video', dest: 'save', audio: {} }));
     check(r1.ok && r1.smart, 'smart cut was used', r1);
     if (r1.ok && FFPROBE) {
       const p = probe(r1.out);
@@ -57,13 +57,15 @@ const cleanDecode = f => { try { execFileSync('/usr/bin/ffmpeg', ['-v', 'error',
     // untouched + named: an instant hard link with the name
     await w.click('#qtreset'); await w.waitForTimeout(400);
     await w.click('#qtcopy'); await waitStatus(/Copied|Couldn't/);
-    const links = fs.readdirSync(path.join(gopLibrary()[0], '.clip-links'), { recursive: true }).map(String);
-    check(links.some(f => /Clutch\.mp4$/.test(f)), 'named copy of the untouched clip is a link', links);
+    // a hard link next to the clip, or (on drives that can't do links) a copy
+    const ldir = path.join(gopLibrary()[0], '.clip-links');
+    const links = fs.existsSync(ldir) ? fs.readdirSync(ldir, { recursive: true }).map(String) : [];
+    check(links.some(f => /Clutch\.mp4$/.test(f)) || /Clutch\.mp4/.test(await statusText()), 'named copy of the untouched clip (link or copy)', links);
 
     // dragging out: the file is ready after a hover/press
-    const nvClip = await w.evaluate(() => document.getElementById('qtname').title);
+    const nvClip = await w.evaluate(() => window.qtActivePath());
     await setTrim('1', '3');
-    await w.keyboard.press('Escape'); await w.waitForTimeout(800);
+    await w.click('.game.home'); await w.waitForTimeout(800);
     const ready = await w.evaluate(async p => { await T.dragPrepare(p); return T.dragReady(p); }, nvClip);
     check(!!ready && /Clutch\.mp4$/.test(ready) && fs.existsSync(ready), 'drag file is ready, named', ready);
 

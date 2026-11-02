@@ -32,7 +32,13 @@
         <div id="folderpanel"><div id="folderlist"></div></div>
       </div>
       <div id="sidefixed"></div>
+      <div id="gamesbar">
+        <button id="gsearchbtn" class="gbar-ico" data-rail-tip="Search games"><span class="ico" data-ico="search"></span></button>
+        <label id="gsearch" class="search"><span class="ico" data-ico="search"></span><input id="gsearchin" type="text" placeholder="Search games" spellcheck="false"><button id="gsearchx" class="gsx" title="Clear"><span class="ico" data-ico="x"></span></button></label>
+        <button id="gsortbtn" class="sortbtn gsort"><span id="gsorttext">Recent</span><span class="ico" data-ico="sort"></span></button>
+      </div>
       <div id="games"></div>
+      <div id="edittabs"></div>
       <div id="sidegrip" title="Drag to resize, double-click to reset"></div>
     </nav>
     <div id="libmain">
@@ -64,13 +70,15 @@
 </div>
 
 <div id="qt" hidden>
-  <div class="qt-box" role="dialog" aria-label="Edit clip">
+  <div class="qt-box trim" role="region" aria-label="Edit clip">
+    <aside class="qt-clips" id="qtclips">
+      <div class="qt-clipshead"><span class="qt-clipstitle" id="qtclipstitle">Clips</span><button class="gpick" id="qtgamepick"></button></div>
+      <div class="qt-listwrap"><div class="qt-cliplist" id="qtcliplist"></div></div>
+      <div class="qt-assets" id="qtassets"></div>
+      <div class="qt-vgrip" id="qtclipsgrip" title="Drag to resize, double-click to reset"></div>
+    </aside>
     <div class="qt-main">
       <div class="qt-head">
-        <div class="qt-nav">
-          <button class="ibtn sm" id="qtprev" title="Previous clip"><span class="ico" data-ico="back"></span></button>
-          <button class="ibtn sm" id="qtnext" title="Next clip"><span class="ico flip" data-ico="back"></span></button>
-        </div>
         <div class="qt-titles">
           <div class="qt-titlerow">
             <button class="qt-title" id="qttitle" title="Rename"><span id="qttitletext"></span><span class="ico" data-ico="edit"></span></button>
@@ -78,17 +86,33 @@
           </div>
           <div class="qt-sub" id="qtsub"></div>
         </div>
+        <button class="btn sm qt-mode" id="qtedit-btn" title="Text, shapes, zoom, blur, music and more, on a full timeline (E)"><span class="ico" data-ico="edit"></span><span>Edit</span></button>
+        <button class="btn sm qt-mode" id="qttrim-btn" title="Back to the quick trim (E)"><span class="ico" data-ico="scissors"></span><span>Back to Trim</span></button>
+        <div class="qt-saving">
+          <button class="btn sm qt-mode" id="qtcancel-btn" title="Discard the changes made in Edit and go back to Trim (E)">Cancel</button>
+          <button class="btn sm primary qt-mode" id="qtsave-btn" title="Keep the changes and go back to Trim">Save Changes</button>
+        </div>
       </div>
-      <div class="qt-stage" id="qtstage"><canvas id="qtcanvas"></canvas><video id="qtvideo" hidden></video><div class="qt-msg" id="qtmsg"></div><div class="qt-flash" id="qtflash"></div></div>
-      <div class="qt-tl">
+      <div class="qt-stage" id="qtstage"><div class="qt-view" id="qtview"><canvas id="qtcanvas"></canvas><video id="qtvideo" hidden></video><div class="qt-levels" id="qtlevels"></div><div class="qt-edit" id="qtedit"></div></div><div class="qt-msg" id="qtmsg"></div><div class="qt-flash" id="qtflash"></div></div>
+      <div class="qt-tools" id="qttools">
+        <button class="qt-tool" data-tool="crop" title="Crop the whole clip to a shape (C)"><span class="ico" data-ico="crop"></span><span>Crop</span></button>
+        <button class="qt-tool" data-tool="zoom" title="Zoom into part of the picture for a while (Z)"><span class="ico" data-ico="zoom"></span><span>Zoom</span></button>
+        <button class="qt-tool" data-tool="blur" title="Blur part of the picture (B)"><span class="ico" data-ico="blur"></span><span>Blur</span></button>
+        <button class="qt-tool" data-tool="draw" title="Draw on the video (D)"><span class="ico" data-ico="draw"></span><span>Draw</span></button>
+      </div>
+      <div class="qt-tl" id="qttl">
         <div class="qt-bar">
-          <div class="qt-time"><b id="qtcur">0:00.00</b> / <span id="qttot">0:00.00</span></div>
+          <div class="qt-time"><b id="qtcur">0:00.00</b> / <span id="qttot">0:00.00</span><span class="qt-frame" id="qtframe"></span></div>
           <div class="qt-transport">
+            <button class="ibtn sm" id="qtmarkin" title="Set the start here (I)"><span class="ico" data-ico="markIn"></span></button>
+            <button class="ibtn sm" id="qtfback" title="One frame back (,)"><span class="ico" data-ico="frameBack"></span></button>
             <button class="ibtn sm" id="qttostart" title="Jump to the start of the trim (Home)"><span class="ico" data-ico="toStart"></span></button>
             <button class="ibtn sm" id="qtback" title="Back 10 seconds (J)"><span class="ico" data-ico="back10"></span></button>
             <button class="ibtn qt-play" id="qtplay" title="Play / pause (Space)"><span class="ico" data-ico="play"></span></button>
             <button class="ibtn sm" id="qtfwd" title="Forward 10 seconds (L)"><span class="ico" data-ico="fwd10"></span></button>
             <button class="ibtn sm" id="qttoend" title="Jump to the end of the trim (End)"><span class="ico" data-ico="toEnd"></span></button>
+            <button class="ibtn sm" id="qtffwd" title="One frame forward (.)"><span class="ico" data-ico="frameFwd"></span></button>
+            <button class="ibtn sm" id="qtmarkout" title="Set the end here (O)"><span class="ico" data-ico="markOut"></span></button>
           </div>
           <div class="qt-barright">
             <button class="ibtn sm on" id="qtloop" title="Loop the trim while playing"><span class="ico" data-ico="loop"></span></button>
@@ -105,6 +129,7 @@
       </div>
     </div>
     <aside class="qt-side">
+      <div class="qt-vgrip left" id="qtsidegrip" title="Drag to resize, double-click to reset"></div>
       <div class="qt-top">
         <div class="qt-listen" id="qtlisten">
             <button class="ibtn sm" id="qtlmute" title="Mute listening (the export is not affected)"><span class="ico" data-ico="headphones"></span></button>
@@ -117,8 +142,9 @@
         <button class="ibtn sm" id="qtclose" title="Close (Esc)"><span class="ico" data-ico="x"></span></button>
       </div>
       <div class="qt-scroll">
-        <h4>Clip Info</h4>
-        <div class="qt-card qt-info"><div id="qtthumb"></div><div class="qt-infotext"><div id="qtname"></div><div id="qtmeta"></div></div></div>
+        <h4 id="qtfxpropsh">Clip</h4>
+        <div class="qt-card qt-fxprops" id="qtfxprops"></div>
+        <div class="qt-clipprops">
         <h4>Trim</h4>
         <div class="qt-card qt-trim">
           <label for="qtin">Start</label><input type="text" class="qt-t" id="qtin" spellcheck="false" title="Type a time and press Enter (I sets it to the playhead)">
@@ -129,6 +155,7 @@
         </div>
         <h4>Audio</h4>
         <div class="qt-card qt-audio" id="qtaudio"></div>
+        </div>
       </div>
       <div class="qt-foot">
         <div class="qt-status" id="qtstatus"></div>
@@ -141,7 +168,44 @@
         </div>
       </div>
     </aside>
+    <div class="etl" id="qtetl">
+      <div class="qt-hgrip" id="qttlgrip" title="Drag to resize, double-click to reset"></div>
+      <div class="etl-bar">
+        <div class="etl-tools">
+          <button class="ibtn sm on" id="etlselect" title="Select and move (V)"><span class="ico" data-ico="select"></span></button>
+          <button class="ibtn sm" id="etlrazor" title="Razor: click a block to cut it there (R)"><span class="ico" data-ico="razor"></span></button>
+          <button class="ibtn sm" id="etlsnap" title="Snapping (hold Alt to do the opposite)"><span class="ico" data-ico="snap"></span></button>
+          <span class="etl-sep"></span>
+          <button class="ibtn sm" id="qtundo" title="Undo (Ctrl+Z)" disabled><span class="ico" data-ico="undo"></span></button>
+          <button class="ibtn sm" id="qtredo" title="Redo (Ctrl+Shift+Z)" disabled><span class="ico" data-ico="redo"></span></button>
+          <span class="etl-time"><b id="etlcur">0:00.00</b> / <span id="etllen">0:00.00</span></span>
+        </div>
+        <div class="etl-transport">
+          <button class="ibtn sm" id="etlmarkin" title="Set the start here (I)"><span class="ico" data-ico="markIn"></span></button>
+          <button class="ibtn sm" id="etlfback" title="One frame back (,)"><span class="ico" data-ico="frameBack"></span></button>
+          <button class="ibtn sm" id="etltostart" title="Jump to the start of the trim (Home)"><span class="ico" data-ico="toStart"></span></button>
+          <button class="ibtn sm" id="etlback" title="Back 10 seconds (J)"><span class="ico" data-ico="back10"></span></button>
+          <button class="ibtn qt-play" id="etlplay" title="Play / pause (Space)"><span class="ico" data-ico="play"></span></button>
+          <button class="ibtn sm" id="etlfwd" title="Forward 10 seconds (L)"><span class="ico" data-ico="fwd10"></span></button>
+          <button class="ibtn sm" id="etltoend" title="Jump to the end of the trim (End)"><span class="ico" data-ico="toEnd"></span></button>
+          <button class="ibtn sm" id="etlffwd" title="One frame forward (.)"><span class="ico" data-ico="frameFwd"></span></button>
+          <button class="ibtn sm" id="etlmarkout" title="Set the end here (O)"><span class="ico" data-ico="markOut"></span></button>
+        </div>
+        <div class="etl-zoom">
+          <button class="ibtn sm on" id="etlloop" title="Loop the trim while playing"><span class="ico" data-ico="loop"></span></button>
+          <span class="etl-sep"></span>
+          <span class="ico" data-ico="zoom"></span>
+          <input type="range" id="etlzoom" min="0" max="100" step="0.5" value="0" title="Zoom the timeline (Ctrl+wheel)">
+          <button class="ibtn sm" id="etlfit" title="Fit the trim"><span class="ico" data-ico="fit"></span></button>
+        </div>
+      </div>
+      <div class="etl-ov" id="etlov" title="Drag to scroll the timeline"><div class="etl-ovtrim"></div><div class="etl-ovwin"></div><div class="etl-ovph"></div></div>
+      <div class="etl-ruler" id="etlruler"></div>
+      <div class="etl-tracks" id="qttracks"></div>
+      <div class="etl-ph" id="etlph"></div>
+    </div>
   </div>
+</div>
 </div>
 
 <div id="drop"><div class="drop-card"><div class="drop-icon"><span class="ico" data-ico="fileOpen"></span></div><div class="drop-title">Drop to edit</div><div class="drop-sub">Drop a folder to add it to your library</div></div></div>

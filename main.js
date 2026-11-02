@@ -11,12 +11,33 @@ try {
   if (FFMPEG) FFMPEG = FFMPEG.replace('app.asar' + path.sep, 'app.asar.unpacked' + path.sep);
 } catch (e) { /* fall back to PATH below */ }
 if (!FFMPEG || !fs.existsSync(FFMPEG)) FFMPEG = 'ffmpeg';
-if (process.env.CLIP_TRIMMER_FFMPEG) FFMPEG = process.env.CLIP_TRIMMER_FFMPEG; // tests: the Linux build can't read MPEG-TS
+if (process.env.BACKSTAGE_FFMPEG) FFMPEG = process.env.BACKSTAGE_FFMPEG; // tests: the Linux build can't read MPEG-TS
 const smartcut = require('./smartcut.js');
 
 const VIDEO_EXT = ['mp4', 'mkv', 'mov', 'webm', 'avi', 'flv', 'ts', 'm4v'];
 
 const state = { outputs: new Set(), child: null, kids: new Set(), cancelled: false };
+
+// ---------- the app's log (userData/logs/app.log): what went wrong, for problem reports ----------
+const logFile = () => path.join(app.getPath('userData'), 'logs', 'app.log');
+function log(...a) {
+  try {
+    const f = logFile();
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    try { if (fs.statSync(f).size > 1 << 20) fs.renameSync(f, f + '.old'); } catch (e) { /* new file */ }
+    const text = a.map(x => (typeof x === 'string' ? x : x instanceof Error ? x.stack || x.message : JSON.stringify(x))).join(' ');
+    fs.appendFileSync(f, `${new Date().toISOString()} ${text.slice(0, 4000)}\n`);
+  } catch (e) { /* never let logging break anything */ }
+}
+function logTail(n) {
+  try {
+    const f = logFile(), st = fs.statSync(f), len = Math.min(st.size, 256 * 1024), b = Buffer.alloc(len);
+    const fd = fs.openSync(f, 'r'); fs.readSync(fd, b, 0, len, st.size - len); fs.closeSync(fd);
+    return b.toString('utf8').split('\n').slice(-n - 1).join('\n').trim();
+  } catch (e) { return ''; }
+}
+process.on('uncaughtException', e => log('error (main):', e));
+process.on('unhandledRejection', e => log('error (main, promise):', e));
 const samePath = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
 // video files opened from outside the clip folders (Open file, drag and drop, paste); the overlay
 // may read and export these too
@@ -26,10 +47,10 @@ const IS_WIN = process.platform === 'win32';
 // Chromium skips drawing pictures it hasn't decoded yet while you scroll and fills them in a
 // moment later, which made cards flash blank. Decode them as they're drawn instead.
 app.commandLine.appendSwitch('disable-checker-imaging');
-// The app's name comes from package.json (productName). Names it used to have, so a rename
-// keeps everyone's settings, caches and trimmed-clips folder.
+// The app's name comes from package.json (productName). Names it used to have (newest first), so a
+// rename keeps everyone's settings, caches and trimmed-clips folder.
 const APP_NAME = app.getName();
-const OLD_NAMES = ['Clip Trimmer'].filter(n => n !== APP_NAME);
+const OLD_NAMES = ['Clip Editor', 'Clip Trimmer'].filter(n => n !== APP_NAME);
 (function keepOldData() {
   // After a rename, bring the old name's settings, trims, clip names, thumbnails and library
   // choices over once. Moving the folder is quickest; if the new one already exists (or the old app
@@ -282,6 +303,7 @@ function runFfmpeg(args, length, onProgress, job = state) {
     child.on('close', code => {
       job.child = null;
       job.kids.delete(child);
+      if (code !== 0 && !job.cancelled) log(`ffmpeg failed (exit ${code}):`, tail.join(' | '), '| args:', args.filter(x => !String(x).includes(path.sep)).join(' ').slice(0, 1500));
       resolve({ ok: code === 0 && !job.cancelled, err: tail, cancelled: job.cancelled });
     });
   });
@@ -449,7 +471,195 @@ function tempDir(tag) {
 
 // list: [{ index, gain }] audio tracks to keep and how loud ([] = no audio). keepTracks: every audio
 // track as it is, plus the file's own info (for replacing the original).
-async function makeFile({ src, info, start, length, audioOnly, list, out, progress, job, keepTracks }) {
+// ---------- effects: crop, zoom, blur, layers, added audio, volume points, fades ----------
+// The editor saves them with the trim (edit.fx). Text, pictures, shapes and drawings arrive as
+// full-frame transparent PNGs the editor drew itself (in userData/fx), so the export shows
+// exactly what the preview did. Any effect means the whole clip is encoded (no smart cut).
+const fxDir = () => { const d = path.join(app.getPath('userData'), 'fx'); fs.mkdirSync(d, { recursive: true }); return d; };
+const fxFile = name => path.join(fxDir(), path.basename(String(name || '')));
+const fxAllowed = new Set(); // added sound files the editor may read
+const num = (v, a, b, d = a) => { v = Number(v); return Number.isFinite(v) ? Math.min(b, Math.max(a, v)) : d; };
+const box01 = b => ({ x: num(b && b.x, 0, 1, 0), y: num(b && b.y, 0, 1, 0), w: num(b && b.w, 0.01, 1, 1), h: num(b && b.h, 0.01, 1, 1) });
+const OVERLAYS = ['text', 'image', 'draw', 'shape'];
+function cleanFx(fx) {
+  if (!fx || typeof fx !== 'object') return null;
+  const out = { crop: null, layers: [], sounds: [], vpts: {}, fades: {} };
+  if (fx.crop) { const c = box01(fx.crop); if (c.w < 0.999 || c.h < 0.999) out.crop = c; }
+  const vtracks = Array.isArray(fx.vtracks) ? fx.vtracks : [], atracks = Array.isArray(fx.atracks) ? fx.atracks : [];
+  for (const l of Array.isArray(fx.layers) ? fx.layers : []) {
+    if (!l || l.hidden || !['zoom', 'blur', ...OVERLAYS].includes(l.type)) continue;
+    if (l.type !== 'zoom' && vtracks[l.track | 0] && vtracks[l.track | 0].hidden) continue; // zooms are on V1, which can't be hidden
+    const L = { type: l.type, track: num(l.track, 0, 99, 0) | 0, start: num(l.start, 0, 1e6), end: num(l.end, 0, 1e6) };
+    if (!(L.end > L.start)) continue;
+    if (l.type === 'zoom') Object.assign(L, { box: box01(l.box), ein: num(l.ein, 0, 30, 0), eout: num(l.eout, 0, 30, 0) });
+    else if (l.type === 'blur') Object.assign(L, { box: box01(l.box), strength: num(l.strength, 1, 10, 5) });
+    else { if (!l.png || !fs.existsSync(fxFile(l.png))) continue; L.png = fxFile(l.png); }
+    out.layers.push(L);
+  }
+  out.layers.sort((a, b) => a.track - b.track || (b.type === 'blur') - (a.type === 'blur')); // higher tracks on top; a track's blur under its drawn layers
+  for (const s of Array.isArray(fx.sounds) ? fx.sounds : []) {
+    if (!s || s.mute || !(num(s.vol, 0, 2, 1) > 0.001) || typeof s.path !== 'string' || !fs.existsSync(s.path)) continue;
+    if (atracks[s.track | 0] && atracks[s.track | 0].mute) continue;
+    const S = { key: 's:' + String(s.id), path: s.path, at: num(s.at, 0, 1e6), from: num(s.from, 0, 1e6), to: num(s.to, 0, 1e6), vol: num(s.vol, 0, 2, 1) };
+    if (!(S.to > S.from)) continue;
+    out.sounds.push(S);
+    // its volume points are kept relative to where it starts
+    if (Array.isArray(s.pts) && s.pts.length) out.vpts[S.key] = s.pts.map(p => [S.at + num(p && p[0], 0, 1e6), num(p && p[1], 0, 2, 1)]).sort((a, b) => a[0] - b[0]);
+  }
+  if (fx.vpts && typeof fx.vpts === 'object') {
+    for (const [k, pts] of Object.entries(fx.vpts)) {
+      if (!Array.isArray(pts) || !pts.length || k.startsWith('s:')) continue;
+      out.vpts[k] = pts.map(p => [num(p && p[0], 0, 1e6), num(p && p[1], 0, 2, 1)]).sort((a, b) => a[0] - b[0]);
+    }
+  }
+  const f = fx.fades || {};
+  for (const k of ['vin', 'vout', 'ain', 'aout']) if (num(f[k], 0, 10, 0) > 0) out.fades[k] = num(f[k], 0, 10, 0);
+  return out.crop || out.layers.length || out.sounds.length || Object.keys(out.vpts).length || Object.keys(out.fades).length ? out : null;
+}
+const f4 = n => String(Math.round(n * 10000) / 10000);
+// a volume curve through the points (straight lines between them), on the export's own clock
+function curveExpr(pts, off) {
+  if (!pts || !pts.length) return null;
+  const p = pts.map(([t, v]) => [t - off, v]);
+  let e = f4(p[p.length - 1][1]);
+  for (let i = p.length - 2; i >= 0; i--) {
+    const [t1, v1] = p[i], [t2, v2] = p[i + 1];
+    const seg = t2 - t1 > 1e-4 ? `${f4(v1)}+(${f4(v2 - v1)})*(t-(${f4(t1)}))/${f4(t2 - t1)}` : f4(v2);
+    e = `if(lt(t,${f4(t2)}),${seg},${e})`;
+  }
+  return `if(lt(t,${f4(p[0][0])}),${f4(p[0][1])},${e})`;
+}
+// zooms: each eases in (smoothstep) over ein, holds, eases out over eout; rect = full frame to box
+function zoomExpr(zooms, off) {
+  const terms = zooms.map(z => {
+    const S = Math.max(0, z.start - off), E = z.end - off, half = (E - S) / 2;
+    const a = Math.min(z.ein, half), b = Math.min(z.eout, half);
+    const rin = a > 0.001 ? `clip((it-(${f4(S)}))/${f4(a)},0,1)` : `gte(it,${f4(S)})`;
+    const rout = b > 0.001 ? `clip((${f4(E)}-it)/${f4(b)},0,1)` : `lt(it,${f4(E)})`;
+    const u = `min(${rin},${rout})`;
+    return { e: `(${u})*(${u})*(3-2*(${u}))`, z };
+  });
+  const sum = g => terms.map(t => `${f4(g(t.z))}*${t.e}`).join('+');
+  return { z: `1/(1-(${sum(z => 1 - z.box.w)}))`, x: `(${sum(z => z.box.x)})*iw`, y: `(${sum(z => z.box.y)})*ih` };
+}
+const even = n => Math.max(2, Math.floor(n / 2) * 2);
+async function fxMake({ src, info, start, length, list, fx, target, out, progress, job, audioOnly }) {
+  fx = fx || { crop: null, layers: [], sounds: [], vpts: {}, fades: {} };
+  const end = start + length, W = info.width || 1920, H = info.height || 1080, fps = info.fps || 30;
+  let cw = even(W), ch = even(H), cx = 0, cy = 0;
+  if (fx.crop) {
+    cw = even(fx.crop.w * W); ch = even(fx.crop.h * H);
+    cx = Math.max(0, Math.min(W - cw, Math.round(fx.crop.x * W))); cy = Math.max(0, Math.min(H - ch, Math.round(fx.crop.y * H)));
+  }
+  const inputs = [...av1In(info.codec), '-ss', start.toFixed(3), '-t', length.toFixed(3), '-i', src];
+  let nIn = 1;
+  const parts = [];
+  let n = 0, cur = '[0:v]';
+  const next = () => `[v${n++}]`;
+  const seen = l => l.end > start && l.start < end;
+  const en = l => `between(t,${f4(Math.max(0, l.start - start))},${f4(l.end - start)})`;
+  // target size: the bitrate that fits, and a smaller picture when that's too few bits for it
+  let vk = Math.round(Math.max(2000, sourceKbps(info) * (cw * ch) / (W * H))), ow = cw, oh = ch, ofps = fps;
+  const hasAudio = list.length || fx.sounds.length;
+  if (target && !audioOnly) {
+    vk = Math.floor(target * 8 / 1000 / length * 0.93 - (hasAudio ? 160 : 0));
+    if (vk < 150) throw new Error(`It's too long to fit in ${Math.round(target / 1048576)} MB. Trim it shorter first.`);
+    const bpp = () => vk * 1000 / (ow * oh * ofps);
+    for (const hh of [1080, 720, 480]) if (bpp() < 0.05 && oh > hh) { ow = even(cw * hh / ch); oh = hh; }
+    if (bpp() < 0.05 && ofps > 60) ofps = 60;
+    if (bpp() < 0.05 && ofps > 30) ofps = 30;
+  }
+  if (!audioOnly) {
+    if (fx.crop) { const o = next(); parts.push(`${cur}crop=${cw}:${ch}:${cx}:${cy}${o}`); cur = o; }
+    const zooms = fx.layers.filter(l => l.type === 'zoom' && seen(l));
+    if (zooms.length) {
+      const z = zoomExpr(zooms, start), o = next();
+      parts.push(`${cur}zoompan=z='${z.z}':x='${z.x}':y='${z.y}':d=1:s=${cw}x${ch}:fps=${f4(fps)}${o}`); cur = o;
+    }
+    // blur boxes and drawn layers, bottom track first: a blur blurs everything under it
+    for (const l of fx.layers.filter(x => x.type !== 'zoom' && seen(x))) {
+      if (OVERLAYS.includes(l.type)) {
+        inputs.push('-i', l.png);
+        const s = next(), o = next();
+        parts.push(`[${nIn++}:v]format=rgba,scale=${cw}:${ch}${s}`, `${cur}${s}overlay=0:0:enable='${en(l)}'${o}`); cur = o;
+        continue;
+      }
+      const bw = even(l.box.w * cw), bh = even(l.box.h * ch);
+      const bx = Math.max(0, Math.min(cw - bw, Math.round(l.box.x * cw))), by = Math.max(0, Math.min(ch - bh, Math.round(l.box.y * ch)));
+      const r = Math.max(1, Math.min(Math.floor(Math.min(bw, bh) / 2) - 1, Math.round(l.strength * ch / 120)));
+      const a = next(), b = next(), c = next(), o = next();
+      parts.push(`${cur}split=2${a}${b}`, `${b}crop=${bw}:${bh}:${bx}:${by},boxblur=${r}:3${c}`, `${a}${c}overlay=${bx}:${by}:enable='${en(l)}'${o}`); cur = o;
+    }
+    const post = [];
+    if (ow !== cw || oh !== ch) post.push(`scale=${ow}:${oh}:flags=lanczos`);
+    if (ofps !== fps) post.push(`fps=${ofps}`);
+    if (fx.fades.vin) post.push(`fade=t=in:st=0:d=${f4(Math.min(fx.fades.vin, length / 2))}`);
+    if (fx.fades.vout) post.push(`fade=t=out:st=${f4(Math.max(0, length - fx.fades.vout))}:d=${f4(Math.min(fx.fades.vout, length / 2))}`);
+    post.push('format=yuv420p');
+    parts.push(`${cur}${post.join(',')}[vout]`);
+  }
+  // sound: the clip's tracks (each with its volume and points) and the added sounds, mixed
+  const labels = [];
+  list.forEach((s, i) => {
+    const c = curveExpr(fx.vpts[s.key], start);
+    const vol = c ? `volume='${f4(s.gain)}*(${c})':eval=frame` : `volume=${f4(s.gain)}`;
+    parts.push(`[0:a:${s.index}]aresample=48000,${info.audio[s.index] && info.audio[s.index].channels === 'mono' ? 'pan=stereo|c0=c0|c1=c0,' : ''}aformat=sample_fmts=fltp:channel_layouts=stereo,${vol}[a${i}]`);
+    labels.push(`[a${i}]`);
+  });
+  fx.sounds.forEach((s, i) => {
+    const from = Math.max(start, s.at), to = Math.min(end, s.at + (s.to - s.from));
+    if (to <= from + 0.01) return;
+    inputs.push('-ss', (s.from + from - s.at).toFixed(3), '-t', (to - from).toFixed(3), '-i', s.path);
+    const c = curveExpr(fx.vpts[s.key], start);
+    const vol = c ? `volume='${f4(s.vol)}*(${c})':eval=frame` : `volume=${f4(s.vol)}`;
+    parts.push(`[${nIn++}:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,adelay=${Math.round((from - start) * 1000)}:all=1,${vol}[s${i}]`);
+    labels.push(`[s${i}]`);
+  });
+  let alabel = null;
+  if (labels.length) {
+    const af = [];
+    if (fx.fades.ain) af.push(`afade=t=in:st=0:d=${f4(Math.min(fx.fades.ain, length / 2))}`);
+    if (fx.fades.aout) af.push(`afade=t=out:st=${f4(Math.max(0, length - fx.fades.aout))}:d=${f4(Math.min(fx.fades.aout, length / 2))}`);
+    const mix = labels.length > 1 ? `amix=inputs=${labels.length}:duration=longest:normalize=0` : 'anull';
+    parts.push(`${labels.join('')}${[mix, ...af].join(',')}[aout]`);
+    alabel = '[aout]';
+  }
+  if (audioOnly && !alabel) throw new Error('All the audio is muted, so there is nothing to export.');
+  const enc = audioOnly ? null : await pickEncoder();
+  const vargs = (e, k) => {
+    if (!target) return e.args(k);
+    if (e.name === 'libx264') return ['-c:v', 'libx264', '-preset', 'veryfast', '-b:v', `${k}k`, '-maxrate', `${k}k`, '-bufsize', `${k * 2}k`, '-pix_fmt', 'yuv420p'];
+    const a = e.args(k), i = a.indexOf('-maxrate');
+    if (i >= 0) a[i + 1] = `${k}k`;
+    return a;
+  };
+  const build = (e, k) => {
+    const a = ['-y', '-hide_banner', '-loglevel', 'error', '-progress', 'pipe:1', '-nostats', ...inputs, '-filter_complex', parts.join(';')];
+    if (!audioOnly) a.push('-map', '[vout]', ...vargs(e, k));
+    if (alabel) a.push('-map', alabel, ...(audioOnly ? ['-c:a', 'libmp3lame', '-b:a', '192k'] : ['-c:a', 'aac', '-b:a', '160k']));
+    else a.push('-an');
+    a.push('-t', length.toFixed(3));
+    if (!audioOnly) a.push('-movflags', '+faststart');
+    a.push(out);
+    return a;
+  };
+  if (audioOnly) return runFfmpeg(build(null, 0), length, progress, job);
+  let r = await runFfmpeg(build(enc, vk), length, progress, job);
+  if (!r.ok && !r.cancelled && enc.name !== 'libx264') r = await runFfmpeg(build({ name: 'libx264', args: X264 }, vk), length, progress, job);
+  // a little over the size: once more with less
+  if (r.ok && target) {
+    try {
+      if (fs.statSync(out).size > target) {
+        r = await runFfmpeg(build(enc, Math.floor(vk * 0.85)), length, progress, job);
+        if (r.ok && fs.statSync(out).size > target) r = { ok: false, err: [`It came out over ${Math.round(target / 1048576)} MB. Try a shorter trim.`] };
+      }
+    } catch (e) { /* keep r */ }
+  }
+  return r;
+}
+
+async function makeFile({ src, info, start, length, audioOnly, list, out, progress, job, keepTracks, fx, target }) {
+  if (!keepTracks && (fx || target)) return fxMake({ src, info, start, length, list, fx, target, out, progress, job, audioOnly });
   if (audioOnly) return runFfmpeg(audioArgs({ src, info, start, length, list, audioOnly, out }), length, progress, job);
   const end = start + length;
   const enc = await pickEncoder();
@@ -525,7 +735,7 @@ async function looksRight(file, length, head) {
 // takes well under a second, so only the last few are kept.
 const prepared = new Map(); // key -> { out, ready: Promise<result>, job, at }
 const KEEP_PREPARED = 20;
-const exportKey = o => JSON.stringify([editKey(o.path), Math.round(o.start * 1000), Math.round(o.end * 1000), o.sources || [], o.title || '']);
+const exportKey = o => JSON.stringify([editKey(o.path), Math.round(o.start * 1000), Math.round(o.end * 1000), o.sources || [], o.title || '', o.fx || null]);
 function dropPrepared(forPath) {
   for (const [k, e] of prepared) {
     if (forPath && JSON.parse(k)[0] !== editKey(forPath)) continue;
@@ -549,21 +759,29 @@ async function savedJob(src, o = {}) {
   const start = Math.max(0, Number(o.start ?? (e && e.in) ?? 0));
   const end = Math.min(Number(o.end ?? (e && e.out) ?? info.duration), info.duration || Infinity);
   const audio = o.audio !== undefined ? o.audio : (e && e.audio) || {};
-  const sources = sourcesFor(info, audio).filter(x => info.audio[x.index] && x.gain > 0.001);
+  const fx = cleanFx(o.fx !== undefined ? o.fx : e && e.fx);
+  const groups = audioGroups(info);
+  let sources;
+  // volume points on the clip's own rows: every row is mixed on its own so each can follow its curve
+  if (fx && Object.keys(fx.vpts).some(k => !k.startsWith('s:'))) {
+    sources = groups.map(g => ({ ...g, ...savedFor(g, audio) })).filter(g => !g.mute && g.vol > 0.001)
+      .flatMap(g => g.idx.map(i => ({ index: i, gain: g.vol, key: g.key })));
+  } else sources = sourcesFor(info, audio).map(x => ({ ...x, key: (groups.find(g => g.idx.includes(x.index)) || {}).key || '' }));
+  sources = sources.filter(x => info.audio[x.index] && x.gain > 0.001);
   const title = await titleOf(src);
   const whole = start <= 0.01 && end >= info.duration - 0.01;
   const plainAudio = Object.values(audio).every(a => !a.mute && Math.abs((+a.vol || 1) - 1) < 0.001);
-  return { info, start, end, sources, title, untouched: whole && plainAudio };
+  return { info, start, end, sources, title, fx, untouched: whole && plainAudio && !fx };
 }
 // make (or reuse) the file for a trim; resolves to { ok, out }
 function prepare(src, j) {
-  const key = exportKey({ path: src, start: j.start, end: j.end, sources: j.sources, title: j.title });
+  const key = exportKey({ path: src, start: j.start, end: j.end, sources: j.sources, title: j.title, fx: j.fx });
   let e = prepared.get(key);
   if (e) { e.at = Date.now(); return e; }
   const dir = tempDir('prep'), out = path.join(dir, outName(src, j.title) + '.mp4');
   const job = { child: null, kids: new Set(), cancelled: false };
   e = { out, job, at: Date.now() };
-  e.ready = makeFile({ src, info: j.info, start: j.start, length: j.end - j.start, audioOnly: false, list: j.sources, out, progress: null, job })
+  e.ready = makeFile({ src, info: j.info, start: j.start, length: j.end - j.start, audioOnly: false, list: j.sources, out, progress: null, job, fx: j.fx })
     .then(r => { if (!r.ok) { prepared.delete(key); fs.rmSync(dir, { recursive: true, force: true }); } return { ...r, out }; });
   prepared.set(key, e);
   trimPrepared();
@@ -616,17 +834,18 @@ async function qtExport(o) {
   const audioOnly = as === 'audio';
   const t0 = Date.now();
   // Copy Video: the ready-made (or instantly made) file
-  if (!audioOnly && (dest === 'clipboard' || dest === 'temp')) {
+  const target = Number(o.target) > 0 ? Math.min(4e9, Number(o.target)) : 0;
+  if (!audioOnly && !target && (dest === 'clipboard' || dest === 'temp')) {
     const { out } = await fileFor(src, o);
     state.outputs.add(out);
     if (dest === 'clipboard') await copyFileToClipboard(out);
     return { out, size: fs.statSync(out).size, seconds: Math.round((Date.now() - t0) / 100) / 10 };
   }
   const j = await savedJob(src, o);
-  const { info, start, end, sources: list, title } = j;
+  const { info, start, end, sources: list, title, fx } = j;
   if (!(end > start)) throw new Error('Invalid start/end.');
   const length = end - start, ext = audioOnly ? '.mp3' : '.mp4';
-  if (audioOnly && !list.length) throw new Error('All the audio is muted, so there is nothing to export.');
+  if (audioOnly && !list.length && !(fx && fx.sounds.length)) throw new Error('All the audio is muted, so there is nothing to export.');
   let out;
   if (dest === 'clipboard' || dest === 'temp') out = path.join(tempDir('copy'), outName(src, title) + ext);
   else if (dest === 'saveas') {
@@ -642,7 +861,7 @@ async function qtExport(o) {
 
   const progress = p => win && !win.isDestroyed() && win.webContents.send('qt-progress', p);
   state.cancelled = false;
-  const r = await makeFile({ src, info, start, length, audioOnly, list, out, progress, job: state });
+  const r = await makeFile({ src, info, start, length, audioOnly, list, out, progress, job: state, fx, target });
   if (r.cancelled) { fs.rmSync(out, { force: true }); return { cancelled: true }; }
   if (!r.ok) { fs.rmSync(out, { force: true }); throw new Error('Export failed: ' + r.err.join(' | ')); }
   state.outputs.add(out);
@@ -796,7 +1015,7 @@ function discordFolder() {
 // Their own folder, one subfolder per game, so the NVIDIA/Discord folders stay just recordings.
 // Default: next to NVIDIA's folder (same drive), else in Videos, named after the app. Changeable in Settings.
 async function exportDir() {
-  if (process.env.CLIP_TRIMMER_EXPORTS) return process.env.CLIP_TRIMMER_EXPORTS;
+  if (process.env.BACKSTAGE_EXPORTS) return process.env.BACKSTAGE_EXPORTS;
   const s = readSettings();
   if (s.exportDir) return s.exportDir;
   const nv = await nvidiaFolder(), base = nv ? path.dirname(nv) : app.getPath('videos');
@@ -831,10 +1050,10 @@ async function exportFolder(src) {
 }
 
 async function libFolders() {
-  if (process.env.CLIP_TRIMMER_LIBRARY) {
-    const l = process.env.CLIP_TRIMMER_LIBRARY.split(path.delimiter).map(p => ({ path: p, kind: 'folder' }));
+  if (process.env.BACKSTAGE_LIBRARY) {
+    const l = process.env.BACKSTAGE_LIBRARY.split(path.delimiter).map(p => ({ path: p, kind: 'folder' }));
     const ex = await exportDir();
-    if (process.env.CLIP_TRIMMER_EXPORTS && isDir(ex)) l.push({ path: ex, kind: 'trimmed' });
+    if (process.env.BACKSTAGE_EXPORTS && isDir(ex)) l.push({ path: ex, kind: 'trimmed' });
     return l;
   }
   const nv = await nvidiaFolder(), dc = discordFolder(), enc = encoreFolder(), ex = await exportDir();
@@ -1018,7 +1237,7 @@ async function scanFolder(root, kind, out, progress) {
       const rawGame = game;
       if (game !== 'Other' && isDesktopName(game)) game = 'Desktop';
       out.push({
-        path: full, root, url: pathToFileURL(full).href, name: d.name, sub, date, size: st.size,
+        path: full, root, url: pathToFileURL(full).href, name: d.name, sub, date, size: st.size, mtime: Math.round(st.mtimeMs),
         source: kind, kind: kind === 'trimmed' ? 'trim' : clipKind(d.name, meta), origin: clipOrigin(d.name, meta, kind), gameName: game, rawGame, fromName: !(meta && meta.app) && folder === null && !!dn,
         duration: e.error ? null : (e.duration || null), users: meta ? meta.users : [], edit: editFor(full),
         title: names.all()[nameKey(st, meta)] || null,
@@ -1246,13 +1465,13 @@ const wrap = fn => async (...a) => {
   catch (e) { return { ok: false, error: e.message || String(e) }; }
 };
 // a clip the app may read and export: in the clip folders, or opened by the user
-const allowed = p => typeof p === 'string' && (inLibrary(p) || opened.has(editKey(p)));
+const allowed = p => typeof p === 'string' && (inLibrary(p) || opened.has(editKey(p)) || fxAllowed.has(editKey(p)));
 
 // ---------- byte access for the player and the audio engine ----------
 // The overlay decodes the clip itself (renderer/gpuplayer.mjs, engine.mjs) and asks for byte
 // ranges. Only clips open in the overlay can be read.
 const fds = new Map(); // path -> file descriptor
-const readable = p => qtFiles.has(editKey(p));
+const readable = p => qtFiles.has(editKey(p)) || fxAllowed.has(editKey(p)); // open clips and the sounds added to them
 function fdFor(p) {
   if (!readable(p)) throw new Error('Not an open file.');
   let fd = fds.get(p);
@@ -1295,6 +1514,58 @@ ipcMain.handle('qt-prepare', wrap(async (_e, o) => {
   const j = await savedJob(src, o);
   if (!j.untouched && j.end > j.start) prepare(src, j);
   return {};
+}));
+// ---------- effects: pictures, sounds and the editor's drawn layers ----------
+ipcMain.handle('fx-png', wrap(async (_e, dataUrl) => {
+  const m = /^data:image\/png;base64,(.+)$/.exec(String(dataUrl || ''));
+  if (!m) throw new Error('Not a picture.');
+  const b = Buffer.from(m[1], 'base64');
+  const name = require('crypto').createHash('sha1').update(b).digest('hex') + '.png';
+  const f = fxFile(name);
+  if (!fs.existsSync(f)) fs.writeFileSync(f, b);
+  return { name };
+}));
+const IMG_EXT = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp']);
+const SND_EXT = new Set(['mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac', 'opus', 'wma']);
+async function fxFileInfo(p) {
+  const ext = path.extname(p).slice(1).toLowerCase();
+  if (!fs.existsSync(p) || !fs.statSync(p).isFile()) throw new Error("That file isn't there.");
+  if (IMG_EXT.has(ext)) {
+    const b = fs.readFileSync(p);
+    const file = require('crypto').createHash('sha1').update(b).digest('hex') + '.' + ext;
+    if (!fs.existsSync(fxFile(file))) fs.writeFileSync(fxFile(file), b);
+    return { kind: 'image', name: path.basename(p), file, url: pathToFileURL(fxFile(file)).href };
+  }
+  if (SND_EXT.has(ext)) {
+    const i = await ffInfo(p);
+    if (!i.audio.length || !(i.duration > 0)) throw new Error('That file has no sound.');
+    fxAllowed.add(editKey(p));
+    return { kind: 'audio', name: path.basename(p, path.extname(p)), path: p, dur: i.duration };
+  }
+  throw new Error('Only pictures (png, jpg) and sounds (mp3, wav, m4a) can be added.');
+}
+ipcMain.handle('fx-pick', wrap(async (_e, kind) => {
+  const image = kind === 'image';
+  const r = await dialog.showOpenDialog(win, {
+    title: image ? 'Add a picture' : 'Add audio',
+    filters: image ? [{ name: 'Pictures', extensions: [...IMG_EXT] }] : [{ name: 'Sound', extensions: [...SND_EXT] }],
+    properties: ['openFile'],
+  });
+  if (r.canceled || !r.filePaths[0]) return { cancelled: true };
+  return fxFileInfo(r.filePaths[0]);
+}));
+ipcMain.handle('fx-file', wrap((_e, p) => fxFileInfo(String(p || ''))));
+// added sounds saved with a clip: the editor may read them again (if they're still there)
+ipcMain.handle('fx-allow', wrap(async (_e, list) => ({
+  found: (Array.isArray(list) ? list : []).map(p => {
+    const ok = typeof p === 'string' && SND_EXT.has(path.extname(p).slice(1).toLowerCase()) && fs.existsSync(p);
+    if (ok) fxAllowed.add(editKey(p));
+    return ok;
+  }),
+})));
+ipcMain.handle('fx-wave', wrap(async (_e, p, dur, buckets) => {
+  if (!fxAllowed.has(editKey(p))) throw new Error('Not an added sound.');
+  return { peaks: await waveform(p, dur, Math.max(50, Math.min(4000, buckets | 0)), [0]) };
 }));
 // copy files to the clipboard: clips, or files the app just made
 ipcMain.handle('copy-files', wrap(async (_e, list) => {
@@ -1674,7 +1945,7 @@ ipcMain.handle('settings-get', wrap(async () => {
     discordIdDetected: s.discordId || null, discordIdManual: s.discordIdManual || null,
     folders: await libFolders(), detected: await detectedFolders(), custom: Array.isArray(s.folders),
     cache: dirSize(thumbDir()),
-    updateMode: updateMode(), updates: !!updater, deleteMode: deleteMode(),
+    updateMode: updateMode(), updates: !!updater, deleteMode: deleteMode(), editSave: s.editSave === 'auto' ? 'auto' : 'manual',
   };
 }));
 ipcMain.handle('settings-set', wrap(async (_e, patch) => {
@@ -1686,6 +1957,7 @@ ipcMain.handle('settings-set', wrap(async (_e, patch) => {
   }
   if (patch && UPDATE_MODES.includes(patch.updateMode)) s.updateMode = patch.updateMode;
   if (patch && ['recycle', 'delete'].includes(patch.deleteMode)) s.deleteMode = patch.deleteMode;
+  if (patch && ['manual', 'auto'].includes(patch.editSave)) s.editSave = patch.editSave;
   writeSettings(s);
   if (patch && patch.updateMode) {
     sendUpdate();
@@ -1726,7 +1998,7 @@ function downloadUpdate() {
   updater.downloadUpdate().catch(e => setUpd({ state: 'error', error: String(e && e.message || e).split('\n')[0] }));
 }
 function setupUpdates() {
-  if (!app.isPackaged || process.env.CLIP_TRIMMER_LIBRARY) return; // dev runs and tests don't update
+  if (!app.isPackaged || process.env.BACKSTAGE_LIBRARY) return; // dev runs and tests don't update
   try { updater = require('electron-updater').autoUpdater; } catch (e) { return; }
   updater.autoDownload = false;          // downloads start from downloadUpdate() (right away in 'auto')
   updater.autoInstallOnAppQuit = true;   // only does something once an update is downloaded
@@ -1743,7 +2015,7 @@ function setupUpdates() {
     const s = readSettings(); s.whatsNew = { version: i.version, notes: notesText(i.releaseNotes) }; delete s.updateLater; writeSettings(s);
     setUpd({ state: 'ready', version: i.version, later: false });
   });
-  updater.on('error', e => setUpd({ state: 'error', error: String(e && e.message || e).split('\n')[0] }));
+  updater.on('error', e => { log('update error:', String(e && e.message || e).split('\n')[0]); setUpd({ state: 'error', error: String(e && e.message || e).split('\n')[0] }); });
   const check = () => {
     if (updateMode() === 'off' || ['checking', 'downloading', 'ready'].includes(upd.state)) return;
     updater.checkForUpdates().catch(() => {});
@@ -1779,13 +2051,13 @@ ipcMain.handle('whats-new', () => {
 });
 // The changelog: every published release's notes (Markdown) from GitHub, newest first.
 // Kept for 10 minutes; on failure the caller falls back to the notes the updater brought.
-const RELEASES_REPO = 'EchoCR772/clip-editor';
+const RELEASES_REPO = 'EchoCR772/backstage';
 let changelogCache = null;
 ipcMain.handle('changelog', wrap(async () => {
   if (changelogCache && Date.now() - changelogCache.at < 10 * 60 * 1000) return { releases: changelogCache.list };
   // package.json's "build" section is stripped from the installed app, so the repo is named here
   const r = await net.fetch(`https://api.github.com/repos/${RELEASES_REPO}/releases?per_page=50`, {
-    headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'Clip-Editor' }, signal: AbortSignal.timeout(8000),
+    headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'Backstage' }, signal: AbortSignal.timeout(8000),
   });
   if (!r.ok) throw new Error(`GitHub said ${r.status}.`);
   const list = (await r.json()).filter(x => !x.draft && !x.prerelease)
@@ -1798,8 +2070,88 @@ ipcMain.handle('changelog', wrap(async () => {
 // For a clips folder the app doesn't detect by itself (OBS, SteelSeries, Medal...), the user can send
 // how that software lays out its clips, so a later version can find it for everyone. Nothing is
 // sent without the user seeing the exact text and clicking Send. The Windows username is replaced.
-const REPORT_FORM = process.env.CLIP_TRIMMER_REPORT_URL || 'https://docs.google.com/forms/d/e/1FAIpQLScXgarClsZdY4vVdcAi2160pKXV9XZzN8lRwkUGNWuuLeFmUA/formResponse';
-const REPORT_FIELDS = { recorder: 'entry.1525447683', version: 'entry.388380471', report: 'entry.1049009954' };
+// ---------- reports (problems, and info about recording software the app doesn't know) ----------
+// Sent to the app's report server: a small Cloudflare Worker (report-worker/ in the repository)
+// that files each one as an issue in a private GitHub repository and later hands the replies back
+// to the PC that sent it (it gives each report a key only that PC has). Nothing secret is in the app.
+const REPORTS_URL = (process.env.BACKSTAGE_REPORT_URL || 'https://backstage-reports.echocr.workers.dev').replace(/\/+$/, '');
+async function postReport(body) {
+  if (!REPORTS_URL) throw new Error("Reports aren't switched on in this version yet.");
+  const r = await net.fetch(REPORTS_URL + '/report', { method: 'POST', body: JSON.stringify({ app: APP_NAME, version: app.getVersion(), ...body }), headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(20000) });
+  let j = {};
+  try { j = await r.json(); } catch (e) { /* not JSON */ }
+  if (!r.ok) throw new Error(j.error || `Couldn't send it (${r.status}). Try again later.`);
+  if (!Number.isInteger(j.number) || typeof j.key !== 'string') throw new Error("The report server's answer didn't make sense. Try again later.");
+  const s = readSettings();
+  s.reports = [...(Array.isArray(s.reports) ? s.reports : []), { n: j.number, key: j.key, kind: body.kind, title: String(body.title || '').slice(0, 90), at: Date.now(), state: 'open', replies: [], seen: 0 }];
+  writeSettings(s);
+  return j;
+}
+// what a problem report carries besides the person's own words (they see all of it first)
+async function problemDetails() {
+  const enc = await pickEncoder().catch(() => ({ name: 'unknown' }));
+  const s = readSettings(), folders = await libFolders().catch(() => []);
+  let gpu = '';
+  try { const g = await app.getGPUInfo('basic'); gpu = (g.gpuDevice || []).map(d => `${d.vendorId.toString(16)}:${d.deviceId.toString(16)}${d.active ? ' (in use)' : ''}`).join(', '); } catch (e) { /* unknown */ }
+  return {
+    windows: `${os.version ? os.version() : 'Windows'} (${os.release()})`,
+    gpu, encoder: enc.name,
+    settings: [`folders: ${folders.map(f => f.kind).join(', ') || 'none'}`, `updates: ${s.updateMode || 'ask'}`, `deleting: ${s.deleteMode || 'recycle'}`].join('; '),
+    log: anonymize(logTail(300)),
+  };
+}
+const detailsText = d => [`App: ${APP_NAME} ${app.getVersion()}`, `Windows: ${d.windows}`, `Graphics: ${d.gpu || 'unknown'}`, `Video encoder: ${d.encoder}`, `Settings: ${d.settings}`, '', 'Log (the last few minutes):', d.log || '(empty)'].join('\n');
+ipcMain.handle('problem-details', wrap(async () => { const d = await problemDetails(); return { text: detailsText(d), ready: !!REPORTS_URL }; }));
+ipcMain.handle('problem-send', wrap(async (_e, o) => {
+  const what = String((o && o.what) || '').trim().slice(0, 4000), doing = String((o && o.doing) || '').trim().slice(0, 2000);
+  if (what.length < 5) throw new Error('Say what happened first.');
+  const details = o && o.details ? await problemDetails() : null;
+  const j = await postReport({ kind: 'problem', title: what.split('\n')[0].slice(0, 80), what: anonymize(what), doing: anonymize(doing), details });
+  log(`problem report #${j.number} sent`);
+  return { number: j.number };
+}));
+// replies to the reports this PC sent (comments on their issues; ones starting with // are private)
+let checkingReports = null;
+async function checkReports() {
+  if (!REPORTS_URL) return { reports: [] };
+  if (checkingReports) return checkingReports;
+  checkingReports = (async () => {
+    const s = readSettings(), list = Array.isArray(s.reports) ? s.reports : [];
+    for (const r of list) {
+      if (r.state === 'closed' && Date.now() - (r.checked || 0) < 7 * 24 * 3600 * 1000) continue;
+      try {
+        const res = await net.fetch(`${REPORTS_URL}/replies?n=${r.n}&key=${encodeURIComponent(r.key)}`, { signal: AbortSignal.timeout(15000) });
+        if (!res.ok) continue;
+        const j = await res.json();
+        r.state = j.state === 'closed' ? 'closed' : 'open';
+        r.replies = (Array.isArray(j.replies) ? j.replies : []).map(x => ({ body: String(x.body || '').slice(0, 8000), at: x.at }));
+        r.checked = Date.now();
+      } catch (e) { /* offline: try again later */ }
+    }
+    const fresh = readSettings();
+    fresh.reports = list;
+    writeSettings(fresh);
+    return { reports: list };
+  })().finally(() => { checkingReports = null; });
+  return checkingReports;
+}
+const unread = list => list.reduce((n, r) => n + Math.max(0, (r.replies || []).length - (r.seen || 0)), 0);
+function watchReports() {
+  if (!REPORTS_URL) return;
+  const tick = async () => { const { reports } = await checkReports(); if (win && !win.isDestroyed()) win.webContents.send('reports', unread(reports)); };
+  setTimeout(tick, 20000);
+  setInterval(tick, 30 * 60 * 1000);
+}
+ipcMain.handle('reports-list', wrap(async (_e, refresh) => {
+  const list = refresh ? (await checkReports()).reports : (readSettings().reports || []);
+  return { reports: list.map(r => ({ n: r.n, kind: r.kind, title: r.title, at: r.at, state: r.state, replies: r.replies || [], unread: Math.max(0, (r.replies || []).length - (r.seen || 0)) })), ready: !!REPORTS_URL, unread: unread(list) };
+}));
+ipcMain.handle('reports-seen', wrap(async () => {
+  const s = readSettings();
+  for (const r of s.reports || []) r.seen = (r.replies || []).length;
+  writeSettings(s);
+  return {};
+}));
 const RECORDERS = [
   [/steelseries|moments/i, 'SteelSeries Moments'], [/\bobs\b|obs[- ]studio/i, 'OBS Studio'], [/medal/i, 'Medal'],
   [/outplayed|overwolf/i, 'Outplayed (Overwolf)'], [/radeon|relive|\bamd\b/i, 'AMD Adrenalin'], [/captures/i, 'Xbox Game Bar'],
@@ -1859,13 +2211,8 @@ async function buildReport(dir) {
 ipcMain.handle('report-build', wrap(async (_e, dir) => buildReport(cleanPath(dir))));
 ipcMain.handle('report-send', wrap(async (_e, dir, recorder, text) => {
   // send exactly what was shown (re-anonymized in case it was edited)
-  const body = new URLSearchParams({
-    [REPORT_FIELDS.recorder]: anonymize(String(recorder || '').slice(0, 100)) || 'Unknown',
-    [REPORT_FIELDS.version]: app.getVersion(),
-    [REPORT_FIELDS.report]: anonymize(String(text || '').slice(0, 20000)),
-  });
-  const r = await net.fetch(REPORT_FORM, { method: 'POST', body: body.toString(), headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, signal: AbortSignal.timeout(15000) });
-  if (!r.ok) throw new Error(`Couldn't send it (${r.status}). Try again later.`);
+  const name = anonymize(String(recorder || '').slice(0, 100)) || 'Unknown';
+  await postReport({ kind: 'recorder', title: name, recorder: name, text: anonymize(String(text || '').slice(0, 20000)) });
   const s = readSettings();
   s.reportedFolders = [...new Set([...(s.reportedFolders || []), cleanPath(dir)])];
   writeSettings(s);
@@ -1908,7 +2255,8 @@ function createWindow() {
     ...size, minWidth: 980, minHeight: 640,
     backgroundColor: '#0a090c',
     title: APP_NAME,
-    icon: path.join(__dirname, 'build', 'icon.png'),
+    // the test build (run from source) gets an orange T badge so it stands out in the taskbar
+    icon: path.join(__dirname, 'build', app.isPackaged ? 'icon.png' : 'icon-test.png'),
     autoHideMenuBar: true,
     // the app draws its own title bar (like Discord's); Windows still draws the window buttons
     titleBarStyle: 'hidden',
@@ -1944,6 +2292,12 @@ function createWindow() {
     }, 400);
   };
   for (const ev of ['resize', 'move', 'maximize', 'unmaximize']) win.on(ev, remember);
+  win.webContents.on('console-message', (e, level, message) => {
+    const lv = typeof level === 'number' ? level : e.level, msg = typeof message === 'string' ? message : e.message;
+    if (lv === 3 || lv === 'error') log('error (window):', String(msg).slice(0, 1500));
+  });
+  win.webContents.on('render-process-gone', (_e, d) => log('window crashed:', d && d.reason));
+  log(`started ${APP_NAME} ${app.getVersion()} on Windows ${os.release()}${app.isPackaged ? '' : ' (test build)'}`);
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
   // a video the app was started with (opened from Explorer)
   win.webContents.once('did-finish-load', () => { if (pendingOpen) { openInWindow(pendingOpen); pendingOpen = null; } });
@@ -1978,6 +2332,7 @@ if (engineTest) { /* the test sets up its own window */ } else if (!gotLock) {
     createWindow();
     setTimeout(cleanLinks, 8000);
     setupUpdates();
+    watchReports();
   });
   app.on('window-all-closed', () => app.quit());
 }

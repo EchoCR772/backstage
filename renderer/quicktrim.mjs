@@ -1,10 +1,13 @@
-// The clip editor: a Discord-style overlay over the library for trimming one clip, with a tab in
-// the title bar for each open clip. Trims, audio settings and names are saved per clip (the file is
-// never changed unless you choose Replace original); Copy/Export make a new file from them.
+// The clip editor: a page beside the sidebar for one clip at a time, in two levels. Trim is the
+// quick one (the clip list, the video, one timeline, Copy Video); Edit adds the asset panel, the
+// picture tools and a full timeline (fx.mjs). Trims, audio settings, effects and names are saved
+// per clip (the file is never changed unless you choose Replace original); Copy/Export make a new
+// file from them.
 // The picture comes from the GPU player (gpuplayer.mjs), the sound from the audio engine
 // (engine.mjs), which also drives the clock the picture follows.
 // Uses the page's shared helpers from app.js / library.js ($, h, T, icoSpan, setIco, fmt, ...).
 import { GpuPlayer, ElementPlayer } from './gpuplayer.mjs';
+import { createFx, curveAt } from './fx.mjs';
 
 const Q = {
   tabs: [], tab: null,      // open clips; the one shown in the editor (null: the library is showing)
@@ -17,6 +20,19 @@ const Q = {
 };
 try { Q.loop = localStorage.getItem('qtLoop') !== 'off'; } catch (e) { /* ignore */ }
 const qclamp = (x, a, b) => Math.min(b, Math.max(a, x));
+Q.hist = []; Q.future = []; Q.snap = null;
+// effects (crop, zoom, layers, added audio...): fx.mjs
+const FX = createFx({
+  Q, seekTo: t => seekTo(t), pause: () => pause(), toggle: () => stageToggle(), changed: () => scheduleSave(),
+  status: (...a) => status(...a), audioChanged: () => syncSounds(), canvas: () => $('qtcanvas'), info: () => Q.info,
+  gainsChanged: () => applyGains(), canUndo: () => Q.hist.length > 0, canRedo: () => Q.future.length > 0,
+  toggleRow: key => { const g = Q.groups.find(x => x.key === key); if (g) { g.mute = !g.mute; applyGains(); buildAudioRows(); FX.renderAll(); scheduleSave(); } },
+  title: () => (Q.clip ? clipTitle(Q.clip) : ''),
+  // V1's edges move the trim: the picture follows the edge while it's dragged
+  trimMove: t => { Q.t = t; if (Q.player) Q.player.show(t); },
+  trimDone: which => { Q.t = which === 'in' ? Q.tin : Math.max(Q.tin, Q.tout - 1 / Q.fps); seekTo(Q.t); drawWave(); scheduleSave(); },
+  panelChanged: () => window.qtSideChanged(), // a sidebar tab folded the panel away or opened it
+});
 const qpct = t => (Q.dur ? t / Q.dur * 100 : 0);
 let tabSeq = 0;
 
@@ -37,6 +53,7 @@ function audioState() {
 // One clip at a time (Q.tab holds it and its state).
 function findTab(path) { return Q.tabs.find(t => samePathR(t.clip.path, path)); }
 async function openQuickTrim(c, el) {
+  if (Q.tab && !samePathR(Q.tab.clip.path, c.path) && !(await canLeave())) return;
   let tab = findTab(c.path);
   if (!tab) {
     for (const t of Q.tabs.slice()) await closeTab(t, true);
@@ -51,7 +68,6 @@ async function activate(tab, el) {
   hideMenu(); stopPreview(); closeSettings();
   Q.tab = tab;
   showEditor(true);
-  renderTabs();
   startFrames();
   if (Q.loaded !== tab) {
     if (Q.loaded) unload();
@@ -59,16 +75,20 @@ async function activate(tab, el) {
   }
   navCommit();
 }
-// going to the library closes the editor
-function qtHide() {
-  if (Q.tab) closeTab(Q.tab);
+// going to the library closes the editor (after asking, when Edit has unsaved changes); false when
+// the user kept editing
+async function qtHide() {
+  if (!Q.tab) return true;
+  if (!(await canLeave())) return false;
+  closeTab(Q.tab);
+  return true;
 }
 window.qtHide = qtHide;
 window.qtIsOpen = () => Q.visible;
 window.qtActivePath = () => (Q.visible && Q.tab ? Q.tab.clip.path : null);
 window.qtHasTab = p => !!findTab(p);
 window.qtActivatePath = p => { const t = findTab(p); if (t) activate(t); return !!t; };
-window.closeActiveTab = () => { if (Q.tab) closeTab(Q.tab); };
+window.closeActiveTab = () => qtHide();
 // what the app menu's Playback items do
 window.qtApi = {
   toggle: () => toggle(), step: d => step(d), seek: d => seekTo(now() + d), loop: () => $('qtloop').click(),
@@ -93,6 +113,7 @@ function showEditor(on) {
     if (L.dirty) loadLibrary();
   }
   $('libtab').classList.toggle('active', !on);
+  sideMode();
 }
 
 async function closeTab(tab, quiet) {
@@ -109,8 +130,6 @@ window.qtCloseTabsFor = async (paths, dirs) => {
   for (const t of Q.tabs.slice()) if (under(t.clip.path)) await closeTab(t);
 };
 
-function renderTabs() { /* no tabs: one clip at a time */ }
-
 // ---------- loading a clip into the editor ----------
 async function load(tab, el) {
   const c = tab.clip;
@@ -119,22 +138,18 @@ async function load(tab, el) {
   Q.clip = c; Q.exporting = false; Q.playing = false; Q.peaks = tab.peaks; Q.info = null;
   el && el.classList.add('opening');
   showHead();
-  $('qtmeta').textContent = '';
-  const th = L.thumbs.get(c.path);
-  $('qtthumb').replaceChildren();
-  if (th && th.url) { const i = new Image(); i.src = th.url; i.alt = ''; $('qtthumb').append(i); }
+  renderClipList();
   status('');
   $('qtmsg').textContent = '';
   $('qtaudio').replaceChildren();
   clearCanvas($('qtstrip'));
-  updateNav();
 
   const r = await T.qtOpen(c.path);
   el && el.classList.remove('opening');
   if (gen !== Q.gen) return;
   if (!r.ok) { status(r.error, 'err'); return; }
   const info = Q.info = r.info;
-  if (r.title !== undefined && r.title !== c.title) { c.title = r.title; showHead(); renderTabs(); }
+  if (r.title !== undefined && r.title !== c.title) { c.title = r.title; showHead(); }
   Q.dur = info.duration || c.duration || 0;
   Q.fps = info.fps || 30;
   const e = r.edit || c.edit || null;
@@ -144,7 +159,13 @@ async function load(tab, el) {
   if (Q.tout - Q.tin < 0.05) { Q.tin = 0; Q.tout = Q.dur; }
   Q.t = qclamp(st ? st.t : Q.tin, Q.tin, Q.tout);
   Q.groups = groupsFrom(info, st ? st.audio : e && e.audio);
-  $('qtmeta').textContent = [fmtSize(info.size), info.width && `${info.width}x${info.height}`, info.fps && `${Math.round(info.fps)} fps`, fmtLen(Q.dur)].filter(Boolean).join('  ·  ');
+  FX.load(st ? st.fx : e && e.fx);
+  // a clip that already has effects opens straight in Edit
+  setLevel(st && st.level ? st.level : FX.hasContent() ? 'edit' : 'trim', true);
+  // added sounds: the editor may read them again if they're still there
+  const snd = FX.sounds();
+  if (snd.length) { const a = await T.fxAllow(snd.map(x => x.path)); snd.forEach((x, i) => { x.missing = !(a.ok && a.found[i]); }); }
+  if (gen !== Q.gen) return;
   $('qttot').textContent = fmt(Q.dur);
   buildAudioRows();
   layoutLane();
@@ -163,7 +184,8 @@ async function load(tab, el) {
   // sound
   try {
     await audioReady;
-    const specs = Q.groups.flatMap(g => g.idx.map(i => ({ key: 't' + i, path: c.path, index: i })));
+    const specs = Q.groups.flatMap(g => g.idx.map(i => ({ key: 't' + i, path: c.path, index: i })))
+      .concat(FX.sounds().filter(x => !x.missing).map(soundSpec));
     if (specs.length) Q.session = await window.ClipAudio.Session.open(specs, reader);
   } catch (err) { Q.session = null; status("The sound can't be previewed for this clip (the export still has it).", 'err', 8000); }
   if (gen !== Q.gen) { closeMedia(); return; }
@@ -173,7 +195,27 @@ async function load(tab, el) {
   if (Q.peaks) drawWave(); else loadWave(gen, tab);
   if (tab.strip && tab.stripW === $('qtstrip').clientWidth) drawSavedStrip(tab); else loadStrip(gen, tab);
   schedulePrepare(400);
+  Q.hist = []; Q.future = []; Q.snap = snapNow(); FX.renderTools();
   startFrames();
+}
+window.qtFx = FX; // tests reach the effects through this
+const soundSpec = x => ({ key: 's' + x.id, path: x.path, index: 0, offset: x.from - x.at, from: x.from, to: x.to });
+// the added sounds changed: the audio engine plays exactly those, where they are now
+async function syncSounds() {
+  const snd = FX.sounds().filter(x => !x.missing);
+  if (!Q.session && snd.length) {
+    try { await audioReady; Q.session = await window.ClipAudio.Session.open([], reader); } catch (e) { return; }
+  }
+  if (Q.session) {
+    for (const key of [...Q.session.tracks.keys()]) if (key[0] === 's' && !snd.some(x => 's' + x.id === key)) Q.session.remove(key);
+    for (const x of snd) {
+      const sp = soundSpec(x), t = Q.session.tracks.get(sp.key);
+      if (!t) await Q.session.add(sp);
+      else if (t.offset !== sp.offset || t.from !== sp.from || t.to !== sp.to) Q.session.setWindow(sp.key, { offset: sp.offset, from: sp.from, to: sp.to });
+    }
+  }
+  applyGains();
+  buildAudioRows();
 }
 // put the current clip away (switching tabs, closing): its state stays with the tab
 function unload() {
@@ -181,7 +223,8 @@ function unload() {
   Q.gen++;
   pause();
   flushSave();
-  if (tab && Q.info) tab.st = { tin: Q.tin, tout: Q.tout, t: Q.t, audio: audioState() };
+  if (tab && Q.info) tab.st = { tin: Q.tin, tout: Q.tout, t: Q.t, audio: audioState(), fx: FX.state(), level: Q.level };
+  FX.unload();
   if (tab) tab.peaks = Q.peaks;
   closeMedia();
   if (Q.clip) T.qtClose(Q.clip.path);
@@ -193,8 +236,6 @@ function showHead() {
   $('qttitletext').textContent = clipTitle(c);
   $('qttitle').classList.toggle('named', !!c.title);
   $('qtsub').replaceChildren(...subParts(c));
-  $('qtname').textContent = c.name;
-  $('qtname').title = c.path;
   document.title = clipTitle(c) + ' - ' + (window.APP_TITLE || T.appName);
 }
 function subParts(c) {
@@ -213,19 +254,12 @@ function subParts(c) {
 window.qtTitleChanged = (p, title) => {
   const t = findTab(p);
   if (t) t.clip.title = title;
-  if (Q.clip && samePathR(Q.clip.path, p)) { Q.clip.title = title; showHead(); }
-  renderTabs();
+  if (Q.clip && samePathR(Q.clip.path, p)) { Q.clip.title = title; showHead(); refreshListCard(Q.clip); FX.renderTracks(); }
 };
 
 // the picture is as big as fits in the stage at its own shape, so its outline sits on the video
-function fitPicture() {
-  const st = $('qtstage'), el = $('qtvideo').hidden ? $('qtcanvas') : $('qtvideo');
-  const vw = (Q.player && Q.player.width) || el.videoWidth || el.width, vh = (Q.player && Q.player.height) || el.videoHeight || el.height;
-  if (!vw || !vh || !st.clientWidth || !st.clientHeight) return;
-  const k = Math.min(st.clientWidth / vw, st.clientHeight / vh);
-  el.style.width = Math.floor(vw * k) + 'px';
-  el.style.height = Math.floor(vh * k) + 'px';
-}
+// (fx.mjs lays it out: the frame is the crop's shape, and the picture moves inside it for zooms)
+function fitPicture() { FX.layout(Q.t); }
 new ResizeObserver(fitPicture).observe($('qtstage'));
 
 function freshCanvas() {
@@ -243,9 +277,9 @@ function closeMedia() {
   if (Q.session) { Q.session.close(); Q.session = null; }
 }
 
-$('qtclose').onclick = () => { if (Q.tab) closeTab(Q.tab); };
+$('qtclose').onclick = () => qtHide();
 // clicking outside the editor closes it (right-clicks do nothing)
-$('qt').addEventListener('pointerdown', e => { if (e.target === $('qt') && e.button === 0 && Q.tab) closeTab(Q.tab); });
+$('qt').addEventListener('pointerdown', e => { if (e.target === $('qt') && e.button === 0) qtHide(); });
 
 // ---------- previous / next clip (in the library's current list) ----------
 function neighbor(d) {
@@ -253,23 +287,230 @@ function neighbor(d) {
   const i = L.list.findIndex(c => samePathR(c.path, Q.clip.path));
   return i < 0 ? null : L.list[i + d] || null;
 }
-function updateNav() { $('qtprev').disabled = !neighbor(-1); $('qtnext').disabled = !neighbor(1); }
-async function step(d) {
-  const c = neighbor(d);
-  if (!c || Q.exporting) return;
+async function step(d) { const c = neighbor(d); if (c) await goClip(c); }
+// the editor moves on to another clip (its edits are saved first)
+async function goClip(c) {
+  if (!c || Q.exporting || !Q.tab) return;
+  if (Q.clip && samePathR(c.path, Q.clip.path)) return;
+  if (!(await canLeave())) return;
   const open = findTab(c.path);
   if (open) { activate(open); return; }
-  // the same tab moves on to the next clip
   const tab = Q.tab;
+  await flushSave();
   unload();
   tab.clip = c; tab.st = null; tab.peaks = null; tab.strip = null;
   if (L.opened && !L.opened.has(c.path)) { L.opened.add(c.path); updateCardEdit(c); }
-  renderTabs();
   await load(tab);
   navCommit();
 }
-$('qtprev').onclick = () => step(-1);
-$('qtnext').onclick = () => step(1);
+
+// ---------- Trim / Edit ----------
+// Trim always saves as you go. Edit does too with Settings > Saving edits on "Save automatically";
+// otherwise (the default) its changes are held (Q.hold) until Save Changes, Cancel puts back how the
+// clip was when Edit opened (Q.editBase), and leaving with unsaved changes asks first. Copy and Export
+// always use what's on screen.
+Q.level = 'trim'; Q.hold = false; Q.editBase = null;
+const manualSave = () => L.editSave !== 'auto';
+function setLevel(level, quiet) {
+  Q.level = level === 'edit' ? 'edit' : 'trim';
+  const edit = Q.level === 'edit';
+  if (Q.saveTimer && Q.saveTimer !== -1) flushSave(); // a change made in Trim saves before Edit starts holding
+  Q.hold = edit && manualSave();
+  Q.editBase = edit ? snapNow() : null;
+  qbox.classList.toggle('edit', edit); qbox.classList.toggle('trim', !edit);
+  qbox.classList.toggle('manual', manualSave());
+  applyUi();
+  sideMode();
+  if (!edit) $('qt').classList.remove('fxsel');
+  FX.setOn(edit);
+  if (!quiet) { renderClipList(); fitPicture(); if (!edit) requestAnimationFrame(() => { layoutLane(); }); }
+  showEditBtn(); showSaveState();
+}
+// in Edit the sidebar holds Edit's tabs instead of the games
+function sideMode() { document.body.classList.toggle('editlevel', Q.visible && Q.level === 'edit'); }
+// Trim's Edit button shows when the clip has effects (they're in the copy either way)
+function showEditBtn() { $('qtedit-btn').classList.toggle('has', FX.hasContent()); }
+const dirty = () => !!(Q.hold && Q.editBase && Q.info && snapNow() !== Q.editBase);
+window.qtDirty = dirty;
+function showSaveState() { $('qtsave-btn').classList.toggle('dirty', dirty()); }
+async function saveChanges() {
+  Q.hold = false;
+  if (!Q.saveTimer) Q.saveTimer = -1;
+  await flushSave();
+  Q.editBase = snapNow();
+}
+async function discardChanges() {
+  if (!Q.editBase) return;
+  const base = Q.editBase;
+  Q.hold = false;
+  clearTimeout(Q.saveTimer); Q.saveTimer = null;
+  applySnap(base); // puts the clip back and saves that (it's what was saved)
+  await flushSave();
+}
+async function backToTrim() {
+  if (Q.level !== 'edit') return;
+  if (dirty()) {
+    const ok = await confirmBox({ title: 'Discard changes?', body: 'The changes you made in Edit will be discarded.', ok: 'Discard' });
+    if (!ok) return;
+    await discardChanges();
+  }
+  setLevel('trim');
+}
+// before switching clips or leaving the editor: true when it's fine to go
+async function canLeave() {
+  if (!dirty()) return true;
+  pause();
+  const v = await choiceBox({ title: 'Unsaved changes', body: 'You have changes in Edit that aren\'t saved yet.',
+    buttons: [{ text: 'Keep Editing', value: null }, { text: 'Discard', value: 'discard', cls: 'danger' }, { text: 'Save Changes', value: 'save', cls: 'primary' }] });
+  if (v === 'save') await saveChanges();
+  else if (v === 'discard') await discardChanges();
+  return !!v;
+}
+window.qtCanLeave = canLeave;
+// closing the window with unsaved changes asks too
+let closeOk = false;
+window.addEventListener('beforeunload', e => {
+  if (closeOk || !window.qtDirty()) return; // (through window so the tests can close the app)
+  e.preventDefault(); e.returnValue = '';
+  canLeave().then(ok => { if (ok) { closeOk = true; window.close(); } });
+});
+// Settings > Saving edits changed while in Edit
+window.qtSaveModeChanged = async () => {
+  qbox.classList.toggle('manual', manualSave());
+  if (Q.level !== 'edit') return;
+  if (!manualSave() && Q.hold) await saveChanges();
+  Q.hold = manualSave(); Q.editBase = snapNow(); showSaveState();
+};
+$('qtedit-btn').onclick = () => setLevel('edit');
+$('qttrim-btn').onclick = () => setLevel('trim');
+$('qtcancel-btn').onclick = () => backToTrim();
+$('qtsave-btn').onclick = async () => { await saveChanges(); setLevel('trim'); };
+
+// ---------- the clip list beside the editor: the library's current list, as its cards ----------
+// It belongs to the sidebar: with the sidebar collapsed it narrows to just the pictures.
+const qls = (k, d) => { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } };
+const qlsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* ignore */ } };
+const UI = { clipsW: qls('qtClipsW', 250), sideW: qls('qtSideW', 330), tlH: qls('qtTlH', 330) };
+const qbox = $('qt').querySelector('.qt-box');
+function applyUi() {
+  qbox.classList.toggle('mini', L.side.collapsed && Q.level !== 'edit');
+  qbox.style.setProperty('--qtclipsw', UI.clipsW + 'px');
+  qbox.style.setProperty('--qtside', UI.sideW + 'px');
+  qbox.style.setProperty('--qttl', UI.tlH + 'px');
+  document.documentElement.style.setProperty('--qttlh', UI.tlH + 'px'); // in Edit the sidebar stops above the timeline
+}
+applyUi();
+const saveUi = () => { qlsSet('qtClipsW', UI.clipsW); qlsSet('qtSideW', UI.sideW); qlsSet('qtTlH', UI.tlH); };
+// the sidebar opened or collapsed
+window.qtSideChanged = () => { applyUi(); if (Q.visible) { fitPicture(); requestAnimationFrame(() => { layoutLane(); FX.renderTracks(); renderClipList(); }); } };
+// Virtual scrolling: every card is the same height, so the cards on screen are worked out from the
+// scroll position; only those (plus OVERSCAN above and below) exist, the rest is empty space that
+// keeps the scrollbar right. Spacing comes from CSS variables on the list (--qc-padx/--qc-gap/--qc-top).
+const OVERSCAN = 6;
+const listBox = $('qtcliplist');
+const VL = { list: [], n: -1, els: new Map(), on: -1, w: 0, cardH: 0, rowH: 0, padx: 0, top: 0, queued: false };
+const listSpace = h('div', 'qc-space');
+listBox.append(listSpace);
+function listMetrics() {
+  const st = getComputedStyle(listBox), num = (k, d) => parseFloat(st.getPropertyValue(k)) || d;
+  const padx = num('--qc-padx', 10), gap = num('--qc-gap', 10), top = num('--qc-top', 2);
+  const w = listBox.clientWidth - padx * 2, cardH = Math.round(w * 3 / 4);
+  return { padx, top, w, cardH, rowH: cardH + gap };
+}
+function placeCard(el, i) {
+  el.style.top = (VL.top + i * VL.rowH) + 'px'; el.style.left = VL.padx + 'px';
+  el.style.width = VL.w + 'px'; el.style.height = VL.cardH + 'px';
+}
+function layoutList() {
+  VL.queued = false;
+  const m = listMetrics();
+  if (m.w <= 0) return;
+  if (m.w !== VL.w || m.rowH !== VL.rowH || m.padx !== VL.padx || m.top !== VL.top) {
+    Object.assign(VL, m);
+    for (const [i, el] of VL.els) placeCard(el, i);
+  }
+  const n = VL.list.length;
+  listSpace.style.height = (VL.top * 2 + n * VL.rowH) + 'px';
+  const y = listBox.scrollTop;
+  const first = Math.max(0, Math.floor((y - VL.top) / VL.rowH) - OVERSCAN);
+  const last = Math.min(n - 1, Math.ceil((y + listBox.clientHeight - VL.top) / VL.rowH) + OVERSCAN);
+  for (const [i, el] of VL.els) {
+    if (i >= first && i <= last) continue;
+    if (preview.el === el) stopPreview();
+    el.remove(); VL.els.delete(i);
+  }
+  for (let i = first; i <= last; i++) {
+    if (VL.els.has(i)) continue;
+    const el = listCard(VL.list[i]);
+    placeCard(el, i);
+    el.classList.toggle('on', i === VL.on);
+    listBox.append(el);
+    VL.els.set(i, el);
+    loadThumb(el); // from the cache once the picture has been made
+  }
+}
+const queueList = () => { if (!VL.queued) { VL.queued = true; requestAnimationFrame(layoutList); } };
+listBox.addEventListener('scroll', queueList, { passive: true });
+new ResizeObserver(queueList).observe(listBox);
+// the library's own card, without the hover seek bar; opening it here moves the editor on to it
+function listCard(c) {
+  const el = card(c);
+  thumbObs.unobserve(el);
+  el.classList.add('lc');
+  el.title = clipTitle(c);
+  const go = e => { if (e) e.stopPropagation(); goClip(el._clip); };
+  el.onclick = e => { if (e.ctrlKey || e.metaKey || e.shiftKey) return; go(e); };
+  el.addEventListener('keydown', e => { if (e.key === 'Enter') { e.stopImmediatePropagation(); go(e); } }, true);
+  return el;
+}
+// the list is the library's current list (the game picked in the sidebar)
+function renderClipList(rebuild, keepScroll) {
+  if (!Q.clip) return;
+  const list = L.list && L.list.length ? L.list : [Q.clip];
+  $('qtclipstitle').textContent = $('libname').textContent || 'Clips';
+  window.fillGamePick($('qtgamepick'));
+  if (rebuild || list !== VL.list || list.length !== VL.n) {
+    for (const el of VL.els.values()) el.remove();
+    VL.els.clear(); VL.list = list; VL.n = list.length;
+  }
+  VL.on = list.findIndex(c => samePathR(c.path, Q.clip.path));
+  for (const [i, el] of VL.els) if ((i === VL.on) !== el.classList.contains('on')) el.classList.toggle('on', i === VL.on);
+  layoutList();
+  // the open clip in view (not when the library refreshed under it)
+  if (VL.on >= 0 && VL.rowH && !keepScroll) {
+    const y = VL.top + VL.on * VL.rowH;
+    if (y < listBox.scrollTop || y + VL.cardH > listBox.scrollTop + listBox.clientHeight) { listBox.scrollTop = Math.max(0, y - (listBox.clientHeight - VL.cardH) / 2); layoutList(); }
+  }
+}
+window.qtListChanged = keepScroll => { if (Q.visible) renderClipList(true, keepScroll); };
+// Edit's Clips tab: the game filter is a picker above the list (with search and sort)
+$('qtgamepick').onclick = () => window.openGamePicker($('qtgamepick'));
+// the open clip's card follows its trim and name
+function refreshListCard(c) {
+  for (const el of VL.els.values()) if (samePathR(el._clip.path, c.path)) { el._clip = c; refreshCard(el, c); }
+}
+backToTop($('qtcliplist'));
+// dragging the dividers: the clip list, the side panel, Edit's timeline (remembered)
+function dragGrip(el, onMove, onReset) {
+  el.addEventListener('pointerdown', e => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    el.setPointerCapture(e.pointerId);
+    document.body.classList.add('resizing');
+    const move = ev => { onMove(ev); applyUi(); fitPicture(); };
+    const up = () => { el.removeEventListener('pointermove', move); document.body.classList.remove('resizing'); saveUi(); fitPicture(); FX.renderTracks(); };
+    el.addEventListener('pointermove', move);
+    el.addEventListener('pointerup', up, { once: true });
+    el.addEventListener('pointercancel', up, { once: true });
+  });
+  el.addEventListener('dblclick', () => { onReset(); applyUi(); saveUi(); fitPicture(); FX.renderTracks(); });
+}
+dragGrip($('qtclipsgrip'), e => { UI.clipsW = Math.round(qclamp(e.clientX - $('qtclips').getBoundingClientRect().left, 190, 420)); }, () => { UI.clipsW = 250; });
+dragGrip($('qtsidegrip'), e => { UI.sideW = Math.round(qclamp(qbox.getBoundingClientRect().right - e.clientX, 280, 560)); }, () => { UI.sideW = 330; });
+dragGrip($('qttlgrip'), e => {
+  const r = qbox.getBoundingClientRect();
+  UI.tlH = Math.round(qclamp(r.bottom - e.clientY, 200, Math.max(220, r.height - 260)));
+}, () => { UI.tlH = 330; });
 
 // ---------- renaming (click the title) ----------
 function editTitle() {
@@ -302,7 +543,7 @@ async function play(from = Q.t) {
   if (from < Q.tin - 0.01 || from >= Q.tout - 0.03) from = Q.tin;
   Q.playing = true;
   Q.starting = true; // until the sound is scheduled, the clock holds at `from`
-  setIco($('qtplay').firstElementChild, 'pause');
+  for (const b of [$('qtplay'), $('etlplay')]) setIco(b.firstElementChild, 'pause');
   Q.base = { t: from, p: performance.now() };
   Q.player.play(clock, from);
   if (Q.session) await Q.session.play(from);
@@ -314,12 +555,13 @@ function pause() {
   Q.t = qclamp(clock(), Q.tin, Q.tout);
   Q.playing = false;
   Q.starting = false;
-  setIco($('qtplay').firstElementChild, 'play');
+  for (const b of [$('qtplay'), $('etlplay')]) setIco(b.firstElementChild, 'play');
   if (Q.session) Q.session.pause();
   if (Q.player) Q.player.stop();
 }
 const toggle = () => (Q.playing ? pause() : play());
 $('qtplay').onclick = toggle;
+$('etlplay').onclick = toggle;
 function seekTo(t) {
   Q.t = qclamp(t, Q.tin, Q.tout);
   if (Q.playing) { play(Q.t); return; }
@@ -327,21 +569,28 @@ function seekTo(t) {
   if (Q.session) Q.session.seek(Q.t);
 }
 const now = () => (Q.playing ? clock() : Q.t);
-$('qttostart').onclick = () => seekTo(Q.tin);
-$('qttoend').onclick = () => { pause(); seekTo(Q.tout - 1 / Q.fps); };
-$('qtback').onclick = () => seekTo(now() - 10);
-$('qtfwd').onclick = () => seekTo(now() + 10);
-function showLoop() { $('qtloop').classList.toggle('on', Q.loop); $('qtloop').dataset.tip = Q.loop ? 'Looping the trim (click to play through once)' : 'Loop the trim while playing'; }
-$('qtloop').onclick = () => { Q.loop = !Q.loop; showLoop(); try { localStorage.setItem('qtLoop', Q.loop ? 'on' : 'off'); } catch (e) { /* ignore */ } };
+// Trim's and Edit's transport bars have the same buttons
+$('qttostart').onclick = $('etltostart').onclick = () => seekTo(Q.tin);
+$('qtmarkin').onclick = $('etlmarkin').onclick = () => setIn(now());
+$('qtmarkout').onclick = $('etlmarkout').onclick = () => setOut(now());
+$('qtfback').onclick = $('etlfback').onclick = () => { pause(); seekTo(Q.t - 1 / Q.fps); };
+$('qtffwd').onclick = $('etlffwd').onclick = () => { pause(); seekTo(Q.t + 1 / Q.fps); };
+window.qtDropFile = (p, x, y) => (Q.info && !Q.exporting ? FX.dropFile(p, x, y) : null);
+$('qttoend').onclick = $('etltoend').onclick = () => { pause(); seekTo(Q.tout - 1 / Q.fps); };
+$('qtback').onclick = $('etlback').onclick = () => seekTo(now() - 10);
+$('qtfwd').onclick = $('etlfwd').onclick = () => seekTo(now() + 10);
+function showLoop() { for (const b of [$('qtloop'), $('etlloop')]) { b.classList.toggle('on', Q.loop); b.dataset.tip = Q.loop ? 'Looping the trim (click to play through once)' : 'Loop the trim while playing'; } }
+$('qtloop').onclick = $('etlloop').onclick = () => { Q.loop = !Q.loop; showLoop(); try { localStorage.setItem('qtLoop', Q.loop ? 'on' : 'off'); } catch (e) { /* ignore */ } };
 showLoop();
 // click the picture to play / pause, with a quick icon like most players
-$('qtstage').addEventListener('click', () => {
+$('qtstage').addEventListener('click', e => { if (!e.target.closest('#qtedit')) stageToggle(); });
+function stageToggle() {
   if (!Q.player || Q.exporting) return;
   toggle();
   const f = $('qtflash');
   f.replaceChildren(icoSpan(Q.playing ? 'play' : 'pause'));
   f.classList.remove('go'); void f.offsetWidth; f.classList.add('go');
-});
+}
 
 // one drawing loop, running while the editor is showing
 function startFrames() { if (!Q.frameOn) { Q.frameOn = true; requestAnimationFrame(frame); } }
@@ -352,12 +601,22 @@ function frame() {
     if (t >= Q.tout - 0.005) { if (Q.loop) play(Q.tin); else { pause(); Q.t = Q.tout; } }
     else Q.t = Math.max(Q.tin, t);
   }
+  FX.frame(Q.t);
+  if (Q.playing) applyGains();
+  // fades in the preview: the picture over black
+  const fd = FX.fades();
+  let vk = 1;
+  if (fd.vin) vk = Math.min(vk, qclamp((Q.t - Q.tin) / fd.vin, 0, 1));
+  if (fd.vout) vk = Math.min(vk, qclamp((Q.tout - Q.t) / fd.vout, 0, 1));
+  $('qtview').style.opacity = vk;
+  $('qtframe').textContent = `frame ${Math.round(Q.t * Q.fps)}`;
   $('qtph').style.left = qpct(Q.t) + '%';
   $('qtsel').style.left = `calc(${qpct(Q.tin)}% - 4px)`;
   $('qtsel').style.width = `calc(${qpct(Q.tout) - qpct(Q.tin)}% + 8px)`;
   $('qtshadeL').style.width = qpct(Q.tin) + '%';
   $('qtshadeR').style.width = (100 - qpct(Q.tout)) + '%';
-  $('qtcur').textContent = fmt(Q.t);
+  $('qtcur').textContent = $('etlcur').textContent = fmt(Q.t);
+  $('etllen').textContent = fmt(Q.tout - Q.tin);
   $('qtlen').textContent = fmt(Q.tout - Q.tin);
   $('qtof').textContent = ` of ${fmt(Q.dur)}`;
   const whole = Q.tin <= 0.01 && Q.tout >= Q.dur - 0.01, sz = Q.info && Q.info.size;
@@ -493,34 +752,66 @@ for (const [id, fn, get] of [['qtin', setIn, () => Q.tin], ['qtout', setOut, () 
 }
 
 function editState() {
-  const audio = audioState();
+  const audio = audioState(), fx = FX.state();
   const trimmed = Q.tin > 0.01 || Q.tout < Q.dur - 0.01;
-  if (!trimmed && !Object.keys(audio).length) return null;
-  return { in: Math.round(Q.tin * 1000) / 1000, out: Math.round(Q.tout * 1000) / 1000, dur: Q.dur, audio };
+  if (!trimmed && !Object.keys(audio).length && !fx) return null;
+  const e = { in: Math.round(Q.tin * 1000) / 1000, out: Math.round(Q.tout * 1000) / 1000, dur: Q.dur, audio };
+  if (fx) e.fx = fx;
+  return e;
 }
+// ---------- undo / redo (Ctrl+Z, Ctrl+Shift+Z): trims, audio rows and effects ----------
+const snapNow = () => JSON.stringify({ tin: Math.round(Q.tin * 1000) / 1000, tout: Math.round(Q.tout * 1000) / 1000, audio: audioState(), fx: FX.state() },
+  (k, v) => (k === 'png' || k === 'sig' || k === 'missing' ? undefined : v));
+function pushHistory() {
+  const s = snapNow();
+  if (Q.snap !== null && s !== Q.snap) { Q.hist.push(Q.snap); if (Q.hist.length > 100) Q.hist.shift(); Q.future = []; }
+  Q.snap = s;
+  FX.renderTools();
+}
+async function undo() { if (!Q.info) return; await flushSave(); if (!Q.hist.length) return; Q.future.push(Q.snap); applySnap(Q.hist.pop()); }
+async function redo() { if (!Q.info) return; await flushSave(); if (!Q.future.length) return; Q.hist.push(Q.snap); applySnap(Q.future.pop()); }
+function applySnap(s) {
+  const o = JSON.parse(s);
+  pause();
+  Q.tin = o.tin; Q.tout = o.tout;
+  for (const g of Q.groups) { const a = o.audio[g.key]; g.mute = !!(a && a.mute); g.vol = a ? qclamp(+a.vol, 0, 2) : 1; }
+  FX.load(o.fx, true); // keeps the tool in use (drawing goes on after Ctrl+Z)
+  Q.snap = s;
+  seekTo(qclamp(Q.t, Q.tin, Q.tout));
+  drawWave();
+  syncSounds();
+  Q.saveTimer = -1;
+  flushSave();
+}
+$('qtundo').onclick = () => undo();
+$('qtredo').onclick = () => redo();
 function scheduleSave() { clearTimeout(Q.saveTimer); Q.saveTimer = setTimeout(flushSave, 250); schedulePrepare(); }
 // make the trimmed clip in the background so Copy Video and dragging the card are instant
 function schedulePrepare(ms = 900) {
   clearTimeout(Q.prepTimer);
   Q.prepTimer = setTimeout(() => {
-    if (!Q.loaded || !Q.info || Q.drag || !editState()) return;
+    if (!Q.loaded || !Q.info || Q.drag || !editState() || FX.state()) return; // effects take a full encode: made when asked
     T.qtPrepare({ path: Q.clip.path, start: Q.tin, end: Q.tout, audio: audioState() });
   }, ms);
 }
-function flushSave() {
+async function flushSave() {
   if (!Q.saveTimer || !Q.clip || !Q.info) return;
   clearTimeout(Q.saveTimer); Q.saveTimer = null;
+  const clip = Q.clip, hold = Q.hold;
+  await FX.rasterize(); // text, pictures, shapes and drawings as PNGs for the export
+  if (hold) { if (Q.clip === clip) { pushHistory(); showSaveState(); } return; } // Edit, not saved yet
   const e = editState();
-  Q.clip.edit = e;
-  T.qtEdit(Q.clip.path, e);
-  updateCardEdit(Q.clip);
+  clip.edit = e;
+  await T.qtEdit(clip.path, e);
+  updateCardEdit(clip);
+  if (Q.clip === clip) { pushHistory(); refreshListCard(clip); }
 }
 
 // ---------- audio rows ----------
 function buildAudioRows() {
   const box = $('qtaudio');
   box.replaceChildren();
-  if (!Q.groups.length) { box.append(h('div', 'qt-none', 'This clip has no sound.')); return; }
+  if (!Q.groups.length && !FX.sounds().length) { box.append(h('div', 'qt-none', 'This clip has no sound.')); }
   for (const g of Q.groups) {
     const row = h('div', 'qt-arow' + (g.open ? ' open' : '') + (g.mute ? ' muted' : ''));
     const head = h('div', 'qt-ahead');
@@ -537,6 +828,7 @@ function buildAudioRows() {
       ren.onclick = () => nameRow(row, g);
       head.append(ren);
     }
+    head.append(ptsBtn(g.key));
     const mute = h('button', 'ibtn sm qt-amute');
     mute.title = g.mute ? 'Unmute' : 'Mute';
     mute.append(icoSpan(g.mute ? 'speakerOff' : 'speaker'));
@@ -554,6 +846,47 @@ function buildAudioRows() {
     }
     box.append(row);
   }
+  // added audio (music, sound effects)
+  for (const x of FX.sounds()) {
+    const row = h('div', 'qt-arow' + (x.open ? ' open' : '') + (x.mute ? ' muted' : '') + (x.missing ? ' missing' : ''));
+    const head = h('div', 'qt-ahead');
+    const name = h('button', 'qt-aname');
+    name.title = x.missing ? `Not found: ${x.path}` : 'Volume';
+    name.append(icoSpan('music'), h('span', 'qt-anametext', x.name + (x.missing ? ' (missing)' : '')), h('span', 'qt-avol', Math.abs(x.vol - 1) > 0.001 ? Math.round(x.vol * 100) + '%' : ''));
+    name.onclick = () => { x.open = !x.open; buildAudioRows(); };
+    const mute = h('button', 'ibtn sm qt-amute');
+    mute.title = x.mute ? 'Unmute' : 'Mute';
+    mute.append(icoSpan(x.mute ? 'speakerOff' : 'speaker'));
+    mute.onclick = () => { x.mute = !x.mute; applyGains(); buildAudioRows(); FX.renderAll(); scheduleSave(); };
+    const del = h('button', 'ibtn sm');
+    del.title = 'Remove this audio';
+    del.append(icoSpan('trash'));
+    del.onclick = () => FX.remove(x.id);
+    head.append(name, ptsBtn('s:' + x.id), mute, del);
+    row.append(head);
+    if (x.open) {
+      const sl = h('div', 'qt-aslider');
+      const r = h('input'); r.type = 'range'; r.min = 0; r.max = 200; r.step = 5; r.value = Math.round(x.vol * 100);
+      const v = h('span', '', Math.round(x.vol * 100) + '%');
+      r.oninput = () => { x.vol = r.value / 100; v.textContent = r.value + '%'; if (x.vol > 0) x.mute = false; applyGains(); row.querySelector('.qt-avol').textContent = Math.abs(x.vol - 1) > 0.001 ? r.value + '%' : ''; scheduleSave(); };
+      r.ondblclick = () => { r.value = 100; r.oninput(); };
+      sl.append(r, v);
+      row.append(sl);
+    }
+    box.append(row);
+  }
+  const add = h('button', 'btn sm ghost qt-addaudio');
+  add.append(icoSpan('plus'), document.createTextNode('Add audio'));
+  add.onclick = () => $('qttools').querySelector('[data-tool=audio]').click();
+  box.append(add);
+}
+// volume points for a row: opens its track on the timeline
+function ptsBtn(key) {
+  const b = h('button', 'ibtn sm qt-apts' + (FX.allPts()[key] ? ' on' : ''));
+  b.title = 'Volume points: change the volume over time on Edit\'s timeline';
+  b.append(icoSpan('points'));
+  b.onclick = () => { if (Q.level !== 'edit') setLevel('edit'); FX.select(key.startsWith('s:') ? key.slice(2) : 'clip'); };
+  return b;
 }
 function nameRow(row, g) {
   const label = row.querySelector('.qt-aname');
@@ -582,9 +915,15 @@ function nameRow(row, g) {
   });
   inp.addEventListener('blur', () => finish(true));
 }
+// each row's volume, following its volume points and the sound fades
 function applyGains() {
   if (!Q.session) return;
-  for (const g of Q.groups) for (const i of g.idx) Q.session.setGain('t' + i, g.mute ? 0 : g.vol);
+  const t = Q.playing ? clock() : Q.t, vp = FX.allPts(), fd = FX.fades();
+  let k = 1;
+  if (fd.ain) k = Math.min(k, qclamp((t - Q.tin) / fd.ain, 0, 1));
+  if (fd.aout) k = Math.min(k, qclamp((Q.tout - t) / fd.aout, 0, 1));
+  for (const g of Q.groups) for (const i of g.idx) Q.session.setGain('t' + i, g.mute ? 0 : g.vol * curveAt(vp[g.key], t) * k);
+  for (const x of FX.sounds()) Q.session.setGain('s' + x.id, FX.aMuted(x) ? 0 : x.vol * curveAt(vp['s:' + x.id], t) * k);
 }
 
 // listening volume (shared with the rest of the app; never changes the export)
@@ -635,15 +974,16 @@ T.onQtProgress(p => {
 const working = text => { const w = h('span', 'qt-working'); w.append(h('span', 'qt-spin'), h('span', '', text + ' '), h('span', 'qt-pct', '')); status([w]); };
 
 // ---------- copy / export ----------
-async function exportAs(as, dest) {
+async function exportAs(as, dest, target) {
   if (!Q.loaded || !Q.info || Q.exporting) return;
   pause();
-  flushSave();
+  if (!Q.saveTimer) Q.saveTimer = -1; // make sure the effects' pictures are saved
+  await flushSave();
   Q.exporting = true;
   $('qt').classList.add('busy');
   // Copy Video is usually ready already; only show progress if it takes a moment
-  const slow = setTimeout(() => { $('qtbar').hidden = false; $('qtbar').value = 0; working(dest === 'clipboard' ? `Making the ${as === 'audio' ? 'audio' : 'clip'}...` : 'Exporting...'); }, dest === 'clipboard' ? 250 : 0);
-  const r = await T.qtExport({ path: Q.clip.path, start: Q.tin, end: Q.tout, as, dest, audio: audioState() });
+  const slow = setTimeout(() => { $('qtbar').hidden = false; $('qtbar').value = 0; working(dest === 'clipboard' ? `Making the ${as === 'audio' ? 'audio' : 'clip'}...` : 'Exporting...'); }, dest === 'clipboard' && !target ? 250 : 0);
+  const r = await T.qtExport({ path: Q.clip.path, start: Q.tin, end: Q.tout, as, dest, audio: audioState(), fx: FX.state(), target: target || 0 });
   clearTimeout(slow);
   Q.exporting = false;
   $('qt').classList.remove('busy');
@@ -654,7 +994,7 @@ async function exportAs(as, dest) {
   const file = r.out.split(/[\\/]/).pop();
   if (dest === 'clipboard') {
     done({ title: as === 'audio' ? 'Audio copied' : 'Copied', detail: `${file}  ·  ${fmtSize(r.size)}`,
-      warn: r.size > 10 * 1048576 && as !== 'audio' ? "Over 10 MB: Discord needs Nitro to send it." : 'Paste into Discord with Ctrl+V.', ms: 9000 });
+      warn: r.size > 20 * 1048576 && as !== 'audio' ? 'Over 20 MB: Discord needs Nitro to send it. Try Copy under 20 MB.' : 'Paste into Discord with Ctrl+V.', ms: 9000 });
   } else {
     done({ title: 'Exported', detail: `${file}  ·  ${fmtSize(r.size)}`, actions: [{ text: 'Show in folder', run: () => T.reveal(r.out) }], ms: 12000 });
     if (L.data) L.dirty = true;
@@ -669,6 +1009,7 @@ async function replaceOriginal() {
   if (!Q.loaded || !Q.info || Q.exporting) return;
   const trimmed = Q.tin > 0.01 || Q.tout < Q.dur - 0.01;
   if (!trimmed) { done({ title: 'Nothing to replace', detail: 'Trim the clip first.', cls: 'err', ms: 5000 }); return; }
+  if (FX.hasVisual()) { done({ title: "Replace original only trims", detail: 'Crop, zoom, text and the other picture effects need an export. Hide or remove them first.', cls: 'err', ms: 8000 }); return; }
   pause();
   if (!(await confirmBox({
     title: 'Replace the original?',
@@ -724,6 +1065,7 @@ $('qtsavemenu').onclick = e => {
   if (menuOpenFor('qtsavemenu')) return;
   menuAbove('qtsavemenu', [
     { icon: 'export', text: 'Export as...', run: () => exportAs('video', 'saveas') },
+    { icon: 'export', text: 'Export under 20 MB (Discord)', run: () => exportAs('video', 'save', 20 * 1048576) },
     { icon: 'music', text: 'Export audio as...', run: () => exportAs('audio', 'saveas') },
     '-',
     { icon: 'replace', text: 'Replace original', run: replaceOriginal, cls: 'danger', disabled: !trimmedNow() },
@@ -732,7 +1074,10 @@ $('qtsavemenu').onclick = e => {
 $('qtcopymenu').onclick = e => {
   e.stopPropagation();
   if (menuOpenFor('qtcopymenu')) return;
-  menuAbove('qtcopymenu', [{ icon: 'music', text: 'Copy Audio', run: () => exportAs('audio', 'clipboard') }]);
+  menuAbove('qtcopymenu', [
+    { icon: 'copy', text: 'Copy under 20 MB (Discord)', run: () => exportAs('video', 'clipboard', 20 * 1048576) },
+    { icon: 'music', text: 'Copy Audio', run: () => exportAs('audio', 'clipboard') },
+  ]);
 };
 $('qtmore').onclick = e => {
   e.stopPropagation();
@@ -752,9 +1097,10 @@ $('qtmore').onclick = e => {
 };
 
 // ---------- shortcuts ----------
-const KEYS = [['Space', 'Play / pause'], ['I  O', 'Set start / end at the playhead'], [',  .', 'One frame back / forward'], ['←  →', 'One frame (Shift = 1 second)'],
+const KEYS = [['Space', 'Play / pause'], ['I  O', 'Set start / end at the playhead'],
+  ['E', 'Edit / back to Trim'], ['C Z T G S B D A', 'Edit: crop, zoom, text, picture, shape, blur, draw, add audio'], ['V  R', 'Edit: select / razor'], ['Del', 'Delete the selected effect'], ['Ctrl+Z', 'Undo'], ['Ctrl+Shift+Z', 'Redo'], [',  .', 'One frame back / forward'], ['←  →', 'One frame (Shift = 1 second)'],
   ['J  L', 'Back / forward 10 seconds'], ['Home  End', 'Jump to start / end of the trim'], ['F2', 'Rename'], ['Ctrl+C', 'Copy the trimmed clip'],
-  ['Esc', 'Close']];
+  ['Esc', 'Deselect'], ['Ctrl+W', 'Close the clip']];
 $('qthelp').onclick = e => {
   e.stopPropagation();
   if ($('qthelpbox')) { $('qthelpbox').remove(); return; }
@@ -769,23 +1115,30 @@ function onKey(e) {
   if (document.querySelector('.modal-ov')) return; // a dialog is open
   const k = e.key.toLowerCase(), ctrl = e.ctrlKey || e.metaKey;
   // text boxes (times, names) handle their own keys
-  if (e.target.tagName === 'INPUT' && e.target.type !== 'range') return;
+  if ((e.target.tagName === 'INPUT' && e.target.type !== 'range') || e.target.tagName === 'TEXTAREA') return;
   e.stopPropagation();
   if (k === 'escape') {
     e.preventDefault();
     if (!$('ctxmenu').hidden) { hideMenu(); return; }
+    if ($('gpicker')) { closeGamePicker(); return; }
     if ($('qthelpbox')) { $('qthelpbox').remove(); return; }
     if (Q.exporting) { T.cancel(); return; }
-    if (Q.tab) closeTab(Q.tab);
+    FX.onKey(e, 'escape'); // deselects / ends a tool; Esc never leaves the editor
     return;
   }
-  if (ctrl && k === 'w') { e.preventDefault(); if (Q.tab) closeTab(Q.tab); return; }
+  if (ctrl && k === 'w') { e.preventDefault(); qtHide(); return; }
+  // Ctrl+B: the sidebar (and the clip list with it)
+  if (ctrl && k === 'b') { e.preventDefault(); toggleSidebar(); return; }
   if (ctrl && k === 'o') { e.preventDefault(); pickFile(); return; }
   if (e.altKey && (k === 'arrowleft' || k === 'arrowright')) { e.preventDefault(); navInput(k === 'arrowleft' ? -1 : 1, true); return; }
+  if (ctrl && k === 'z') { e.preventDefault(); if (e.shiftKey) redo(); else undo(); return; }
+  if (ctrl && !e.shiftKey && !e.altKey && FX.onCtrl(e, k)) { e.preventDefault(); return; }
   if (ctrl && k === 'c') { if (String(window.getSelection())) return; e.preventDefault(); exportAs('video', 'clipboard'); return; }
   if (ctrl && k === 'v') { pasteKey(); return; }
   if (k === 'f2') { e.preventDefault(); editTitle(); return; }
   if (ctrl || e.altKey || !Q.dur || Q.exporting) return;
+  if (FX.onKey(e, k)) { e.preventDefault(); return; }
+  if (k === 'e') { e.preventDefault(); if (Q.level === 'edit') backToTrim(); else setLevel('edit'); return; }
   const frameStep = 1 / Q.fps;
   let handled = true;
   if (k === ' ') toggle();

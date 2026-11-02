@@ -43,7 +43,7 @@ const { launch, checker, bigLibrary } = require('./helpers');
     check(news > 1, 'NEW badges', news);
     check(await w.$eval('.month', e => e.textContent) !== '', 'month sections');
     await w.click('.clip >> nth=1'); await w.waitForSelector('#qt.on'); await w.waitForTimeout(600);
-    await w.keyboard.press('Escape'); await w.waitForTimeout(600);
+    await w.click('.game.home'); await w.waitForTimeout(600);
     check(await w.$$eval('#libgrid .clip .cnew', e => e.length) === news - 1, 'opening a clip clears its NEW');
     await w.evaluate(() => { L.newSince = Date.now(); renderGrid(); });
 
@@ -92,17 +92,18 @@ const { launch, checker, bigLibrary } = require('./helpers');
     await w.click('.game:has-text("All clips")'); await w.waitForTimeout(400);
     await w.click('.game:has-text("Destiny 2")'); await w.waitForTimeout(500);
     await w.click('.clip >> nth=0'); await w.waitForSelector('#qt.on'); await w.waitForTimeout(1000);
-    const first = await w.$eval('#qtname', e => e.textContent);
-    await w.click('#qtnext'); await w.waitForTimeout(1200);
-    const second = await w.$eval('#qtname', e => e.textContent);
+    const first = await w.evaluate(() => window.qtActivePath());
+    await w.click('#qtcliplist .clip:not(.on) >> nth=0'); await w.waitForTimeout(1200);
+    const second = await w.evaluate(() => window.qtActivePath());
     check(second !== first, 'next clip', [first, second]);
     check(await w.$$eval('#tabs .cliptab', t => t.length) === 0, 'no tabs');
     await w.click('#libtab'); await w.waitForTimeout(500);
     check(await w.$eval('#qt', e => e.hidden), 'the title closes the editor');
     await w.click('.clip >> nth=1'); await w.waitForSelector('#qt.on'); await w.waitForTimeout(800);
-    await w.click('.clip >> nth=0').catch(() => {});
-    await w.mouse.click(5, 500); await w.waitForTimeout(500);
-    check(await w.$eval('#qt', e => e.hidden), 'clicking outside closes the editor');
+    await w.click('.game:has-text("All clips")'); await w.waitForTimeout(500);
+    check(!(await w.$eval('#qt', e => e.hidden)) && await w.evaluate(() => L.game) === 'all', 'clicking a game in the sidebar while editing filters the clip list, staying in the editor');
+    await w.click('.game.home'); await w.waitForTimeout(500);
+    check(await w.$eval('#qt', e => e.hidden), 'Home goes back to the library');
     await w.click('#navback'); await w.waitForTimeout(600);
     check(await w.$eval('#qt', e => e.hidden), 'back skips closed clips');
 
@@ -113,9 +114,10 @@ const { launch, checker, bigLibrary } = require('./helpers');
     const drags = await run.app.evaluate(() => global.__drags);
     check(drags.length === 1 && drags[0] === await w.evaluate(() => window.__dragged), 'dragging an untouched card starts a drag of the clip', drags);
     // clicking the game you're on goes back to all clips; clicking All clips again does nothing
+    if (await w.evaluate(() => L.game !== 'all')) { await w.click('.game:has-text("All clips")'); await w.waitForTimeout(400); }
     await w.click('.game:has-text("Destiny 2")'); await w.waitForTimeout(400);
     await w.click('.game:has-text("Destiny 2")'); await w.waitForTimeout(400);
-    check(await w.$eval('#libname', e => e.textContent) === 'All clips', 'clicking the current game shows all clips');
+    check(await w.$eval('#libname', e => e.textContent) === 'All clips', 'clicking the current game shows all clips', await w.$eval('#libname', e => e.textContent));
     const before2 = await w.evaluate(() => { window.__cards = [...document.querySelectorAll('#libgrid .clip')]; return window.__cards.length; });
     await w.click('.game:has-text("All clips")'); await w.waitForTimeout(400);
     check(await w.evaluate(() => [...document.querySelectorAll('#libgrid .clip')].every(x => window.__cards.includes(x))) && before2 > 0, 'clicking All clips again leaves the cards alone');
@@ -130,7 +132,7 @@ const { launch, checker, bigLibrary } = require('./helpers');
     await w.keyboard.press('Control+Comma'); await w.waitForTimeout(500);
     const modes = await w.$$eval('.setsec:has(h3:text-is("Updates")) .setopt', els => els.map(e => [e.querySelector('.setname').textContent, e.classList.contains('on')]));
     check(JSON.stringify(modes) === JSON.stringify([['Ask first', true], ['Automatic', false], ['Off', false]]), 'update modes, Ask first by default', modes);
-    await w.click('.setopt:has-text("Automatic")'); await w.waitForTimeout(400);
+    await w.click('.setsec:has(h3:text-is("Updates")) .setopt:has-text("Automatic")'); await w.waitForTimeout(400);
     check(await w.evaluate(async () => (await T.settingsGet()).updateMode) === 'auto', 'update mode saved');
     await w.click('.setopt:has-text("Ask first")'); await w.waitForTimeout(400);
     await w.keyboard.press('Escape'); await w.waitForTimeout(300);
@@ -162,14 +164,14 @@ const { launch, checker, bigLibrary } = require('./helpers');
   run = await launch({ name: 'library-big', library: bigLibrary() });
   try {
     const { w } = run;
-    await w.waitForFunction(() => [...document.querySelectorAll('.clip')].every(c => c.querySelector(':scope > img')), null, { timeout: 30000 }).catch(() => {});
-    check(await w.evaluate(() => [...document.querySelectorAll('.clip')].filter(c => !c.querySelector(':scope > img')).length) === 0, 'every card has its picture');
+    await w.waitForFunction(() => [...document.querySelectorAll('#libgrid .clip')].every(c => c.querySelector(':scope > img')), null, { timeout: 30000 }).catch(() => {});
+    check(await w.evaluate(() => [...document.querySelectorAll('#libgrid .clip')].filter(c => !c.querySelector(':scope > img')).length) === 0, 'every card has its picture');
     await w.evaluate(() => { window.__v = 0; new MutationObserver(ms => { for (const m of ms) for (const n of m.addedNodes) if (n.nodeName === 'VIDEO') window.__v++; }).observe(document.getElementById('libgrid'), { childList: true, subtree: true }); });
     await w.mouse.move(700, 500);
     for (let i = 0; i < 20; i++) { await w.mouse.wheel(0, 300); await w.waitForTimeout(50); }
     check(await w.evaluate(() => window.__v) === 0, 'no previews start while scrolling');
     await w.waitForTimeout(400);
-    const c = await w.evaluate(() => { const els = [...document.querySelectorAll('.clip')].filter(x => { const b = x.getBoundingClientRect(); return b.top > 100 && b.bottom < 900; }); const b = els[0].getBoundingClientRect(); return { x: b.x + b.width / 2, y: b.y + b.height / 2 }; });
+    const c = await w.evaluate(() => { const els = [...document.querySelectorAll('#libgrid .clip')].filter(x => { const b = x.getBoundingClientRect(); return b.top > 100 && b.bottom < 900; }); const b = els[0].getBoundingClientRect(); return { x: b.x + b.width / 2, y: b.y + b.height / 2 }; });
     await w.mouse.move(c.x, c.y); await w.waitForTimeout(250); await w.mouse.wheel(0, -120); await w.waitForTimeout(600); await w.mouse.move(c.x + 3, c.y + 3); await w.waitForTimeout(1200);
     check(await w.evaluate(() => window.__v) >= 1, 'card under the mouse previews after scrolling stops');
     // a library refresh (a new clip saved, say) keeps the existing cards instead of rebuilding them

@@ -1,8 +1,8 @@
 {
-  "name": "clip-editor",
-  "productName": "Clip Editor",
-  "version": "1.47.0",
-  "description": "Trim and share video clips",
+  "name": "backstage",
+  "productName": "Backstage",
+  "version": "1.48.0",
+  "description": "Trim, edit and share your game clips",
   "main": "main.js",
   "author": "Echo",
   "license": "MIT",
@@ -21,8 +21,8 @@
     "mediabunny": "^1.62.1"
   },
   "build": {
-    "appId": "com.cristian.cliptrimmer",
-    "productName": "Clip Editor",
+    "appId": "com.echocr.backstage",
+    "productName": "Backstage",
     "files": [
       "main.js",
       "preload.js",
@@ -51,9 +51,9 @@
       "oneClick": false,
       "createStartMenuShortcut": true,
       "createDesktopShortcut": true,
-      "shortcutName": "Clip Editor",
+      "shortcutName": "Backstage",
       "allowToChangeInstallationDirectory": true,
-      "artifactName": "Clip-Editor-Setup-${version}.exe"
+      "artifactName": "Backstage-Setup-${version}.exe"
     },
     "directories": {
       "output": "dist"
@@ -62,13 +62,13 @@
       {
         "provider": "github",
         "owner": "EchoCR772",
-        "repo": "clip-editor",
+        "repo": "backstage",
         "releaseType": "release"
       }
     ]
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/EchoCR772/clip-editor.git"
+    "url": "https://github.com/EchoCR772/backstage.git"
   }
 }

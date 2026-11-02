@@ -1,9 +1,9 @@
-# Third-party software in Clip Editor
+# Third-party software in Backstage
 
-Clip Editor's own code is under the MIT license (see LICENSE). The installed app also contains:
+Backstage's own code is under the MIT license (see LICENSE). The installed app also contains:
 
 ## FFmpeg
-- Used as a separate program to read, cut and make videos (it is not linked into Clip Editor).
+- Used as a separate program to read, cut and make videos (it is not linked into Backstage).
 - License: GNU General Public License v3 or later. The full license text is installed next to the program as `ffmpeg.LICENSE` (in `resources/app.asar.unpacked/node_modules/ffmpeg-static/`).
 - Binary from [ffmpeg-static](https://github.com/eugeneware/ffmpeg-static) 5.3.0 (release b6.1.1). FFmpeg source code: https://ffmpeg.org/download.html and the build details in that project.
 

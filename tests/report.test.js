@@ -1,6 +1,7 @@
-// "Help add recording software": the card beside a newly added folder, the preview (exactly what is
-// sent, username replaced), sending (to a local stand-in for the form), closing the card for good,
-// and the Settings section.
+// Reports, through a local stand-in for the report server (report-worker/):
+// "Help add recording software" (the card beside a newly added folder, the preview of exactly what is
+// sent with the username replaced, closing the card for good, the Settings section), and
+// Help > Report a Problem with the log attached, and replies showing in Help > My Reports.
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
@@ -16,11 +17,24 @@ const { launch, checker, OUT, FIX } = require('./helpers');
   for (const [d, n] of [[path.join(ss, 'Valorant'), 'Valorant_2026-10-30_21-14-02.mp4'], [path.join(ss, 'Deadlock'), 'Deadlock_2026-10-29_20-01-10.mp4'], [other, 'clip.mp4']]) {
     fs.mkdirSync(d, { recursive: true }); fs.copyFileSync(clip, path.join(d, n));
   }
-  // stand-in for the Google Form
+  // stand-in for the report server: files reports, gives replies to the right key only
   const got = [];
-  const srv = http.createServer((req, res) => { let b = ''; req.on('data', c => (b += c)); req.on('end', () => { got.push(b); res.end('ok'); }); });
+  const srv = http.createServer((req, res) => {
+    let b = '';
+    req.on('data', c => (b += c));
+    req.on('end', () => {
+      res.setHeader('content-type', 'application/json');
+      if (req.method === 'POST' && req.url === '/report') { got.push(JSON.parse(b)); res.end(JSON.stringify({ number: got.length, key: 'key' + got.length })); return; }
+      const u = new URL(req.url, 'http://x');
+      if (u.pathname === '/replies' && u.searchParams.get('key') === 'key' + u.searchParams.get('n')) {
+        res.end(JSON.stringify({ state: u.searchParams.get('n') === '2' ? 'closed' : 'open', replies: u.searchParams.get('n') === '2' ? [{ body: 'Fixed in the **next** version.', at: new Date().toISOString() }] : [] }));
+        return;
+      }
+      res.statusCode = 404; res.end('{}');
+    });
+  });
   await new Promise(r => srv.listen(0, '127.0.0.1', r));
-  process.env.CLIP_TRIMMER_REPORT_URL = `http://127.0.0.1:${srv.address().port}/formResponse`;
+  process.env.BACKSTAGE_REPORT_URL = `http://127.0.0.1:${srv.address().port}`;
   process.env.HOME = path.resolve(OUT, '..', '..', '..'); // so the folder sits under "your user folder"
 
   const run = await launch({ name: 'report', library: [path.join(FIX, 'nv'), ss, other] });
@@ -43,9 +57,9 @@ const { launch, checker, OUT, FIX } = require('./helpers');
     check(/Audio tracks: (\d+|none)/.test(pv.pre) && /App version/.test(pv.all) && /%USERNAME%/.test(pv.all), 'audio tracks, version and the privacy note shown');
     await w.click('.modal.report .mbtn.primary'); await w.waitForTimeout(1200);
     check(got.length === 1, 'sent once', got.length);
-    const sent = new URLSearchParams(got[0] || '');
-    check(sent.get('entry.1525447683') === 'SteelSeries Moments' && /^\d+\.\d+\.\d+$/.test(sent.get('entry.388380471') || '') && sent.get('entry.1049009954') === pv.pre, 'sent exactly what was shown', [...sent.keys()]);
-    check(!(got[0] || '').includes(encodeURIComponent(process.env.HOME)) && !(got[0] || '').includes(process.env.HOME), 'no user folder in what was sent');
+    const sent = got[0] || {};
+    check(sent.kind === 'recorder' && sent.recorder === 'SteelSeries Moments' && /^\d+\.\d+\.\d+$/.test(sent.version || '') && sent.text === pv.pre, 'sent exactly what was shown', Object.keys(sent));
+    check(!JSON.stringify(got[0] || '').includes(process.env.HOME), 'no user folder in what was sent');
     check(!(await w.$('.modal.report')), 'preview closes after sending');
     check(await w.evaluate(async d => (await T.reportCard(d)).show, ss) === false, 'no card again for a folder already sent');
 
@@ -60,6 +74,25 @@ const { launch, checker, OUT, FIX } = require('./helpers');
     await w.keyboard.press('Control+Comma'); await w.waitForTimeout(800);
     const rows = await w.$$eval('.setsec', ss2 => { const s = ss2.find(x => x.querySelector('h3').textContent === 'Help add recording software'); return s ? [...s.querySelectorAll('.setrow')].map(r => r.innerText.replace(/\s+/g, ' ')) : null; });
     check(rows && rows.length === 3 && rows.some(r => /SteelSeries Moments .*Sent · send again/.test(r)) && rows.some(r => /Send info/.test(r)), 'Settings lists the folders and what was sent', rows);
+    await w.keyboard.press('Escape'); await w.waitForTimeout(400);
+
+    // Help > Report a Problem: what happened, the log and PC details (seen first), then sent
+    await w.evaluate(() => problemBox());
+    await w.waitForSelector('.modal.report .report-ta', { timeout: 5000 });
+    await w.waitForFunction(() => !/Loading/.test(document.querySelector('.report-pre').textContent), null, { timeout: 15000 });
+    const pre2 = await w.$eval('.report-pre', e => e.textContent);
+    check(/App: Backstage/.test(pre2) && /Log \(the last few minutes\)/.test(pre2) && /started Backstage/.test(pre2) && !pre2.includes(process.env.HOME), 'what is sent: version, PC details and the log, without the user folder', pre2.slice(0, 300));
+    await w.fill('.modal.report .report-ta >> nth=0', 'The export button did nothing');
+    await w.fill('.modal.report .report-ta >> nth=1', 'Exporting a Discord clip');
+    await w.click('.modal.report .mbtn.primary'); await w.waitForTimeout(1500);
+    const p2 = got[1] || {};
+    check(p2.kind === 'problem' && p2.what === 'The export button did nothing' && p2.doing === 'Exporting a Discord clip' && p2.details && /started Backstage/.test(p2.details.log || ''), 'problem report sent with the log', Object.keys(p2));
+    check(!(await w.$('.modal.report')), 'report box closes after sending');
+    // replies show in My Reports (and only the report they belong to)
+    await w.evaluate(() => reportsBox());
+    await w.waitForSelector('.modal.reports .rep', { timeout: 8000 });
+    const reps = await w.$$eval('.modal.reports .rep', es => es.map(e => e.innerText.replace(/\s+/g, ' ')));
+    check(reps.length === 2 && /Fixed in the next version/.test(reps[0]) && /Closed/.test(reps[0]) && /No reply yet/.test(reps[1]), 'My Reports shows the reply under the right report', reps);
     check(!run.errs.length, 'no page errors', run.errs);
   } catch (err) { check(false, 'test crashed: ' + err.message); } finally { await run.app.close(); srv.close(); done(); }
 })();

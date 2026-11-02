@@ -1,4 +1,4 @@
-// Clip editor end to end: open, play, trim with keys and typed times, playhead stays inside the
+// The editor end to end: open, play, trim with keys and typed times, playhead stays inside the
 // selection, a row per person, mute, export video/audio, copy (made ahead), menus, saved trim,
 // card length, card copy, transport buttons, click-to-pause, rename from the title.
 const fs = require('fs');
@@ -72,20 +72,22 @@ const { launch, checker, openDiscordClip } = require('./helpers');
 
     // menus: arrow next to Copy Video, arrow next to Export; clicking again closes
     await w.click('#qtcopymenu'); await w.waitForTimeout(200);
-    check(await w.$eval('#ctxmenu', m => !m.hidden && m.innerText === 'Copy Audio'), 'copy arrow menu');
+    check(await w.$eval('#ctxmenu', m => !m.hidden && m.innerText === 'Copy under 20 MB (Discord)\nCopy Audio'), 'copy arrow menu');
     await w.click('#qtcopymenu'); await w.waitForTimeout(200);
     check(await w.$eval('#ctxmenu', m => m.hidden), 'copy arrow closes on second click');
     await w.click('#qtsavemenu'); await w.waitForTimeout(200);
-    check(await w.$eval('#ctxmenu', m => m.innerText) === 'Export as...\nExport audio as...\nReplace original', 'export arrow menu', await w.$eval('#ctxmenu', m => m.innerText));
+    check(await w.$eval('#ctxmenu', m => m.innerText) === 'Export as...\nExport under 20 MB (Discord)\nExport audio as...\nReplace original', 'export arrow menu', await w.$eval('#ctxmenu', m => m.innerText));
     await w.keyboard.press('Escape'); await w.waitForTimeout(200);
     check(await w.$eval('#ctxmenu', m => m.hidden) && await w.$eval('#qt', q => q.classList.contains('on')), 'Escape closes the menu, not the editor');
 
-    // right-clicking outside the editor does nothing
-    await w.mouse.click(8, 300, { button: 'right' }); await w.waitForTimeout(300);
-    check(await w.$eval('#qt', q => q.classList.contains('on')), 'right-click outside keeps the editor open');
+    // the editor is a page beside the games sidebar, with the clip list
+    const page = await w.evaluate(() => ({ qt: document.getElementById('qt').getBoundingClientRect().left, side: document.getElementById('libside').getBoundingClientRect().right, items: document.querySelectorAll('#qtcliplist .clip').length, on: document.querySelectorAll('#qtcliplist .clip.on').length }));
+    check(Math.abs(page.qt - page.side) < 2 && page.items > 0 && page.on === 1, 'editor page sits beside the sidebar with the clip list', page);
 
     // close: the trim is saved and the card shows the trimmed length
-    await w.keyboard.press('Escape'); await w.waitForTimeout(800);
+    await w.keyboard.press('Escape'); await w.waitForTimeout(400);
+    check(!(await w.$eval('#qt', e => e.hidden)), 'Escape does not leave the editor');
+    await w.click('.game.home'); await w.waitForTimeout(800);
     check(await w.$eval('#qt', e => e.hidden), 'editor closes');
     const card = await w.$eval('.clip:has(.csrc.discord) >> nth=0', e => ({ len: e.querySelector('.cdur').textContent, edit: e._clip.edit, dur: e._clip.duration }));
     check(card.len === '0:03', 'card shows trimmed length', card);
@@ -99,7 +101,7 @@ const { launch, checker, openDiscordClip } = require('./helpers');
     await w.click('#qttitle'); await w.waitForTimeout(150);
     await w.fill('#qttitlein', 'Nice shot'); await w.press('#qttitlein', 'Enter'); await w.waitForTimeout(600);
     check(await w.$eval('#qttitletext', x => x.textContent) === 'Nice shot', 'renamed title');
-    await w.keyboard.press('Escape'); await w.waitForTimeout(600);
+    await w.click('.game.home'); await w.waitForTimeout(600);
     check(await w.$eval('.clip:has(.csrc.discord) >> nth=0', x => x.querySelector('.ctitle').textContent) === 'Nice shot', 'card shows the name');
     check(fs.existsSync(path.join(ud, 'names.json')), 'names saved');
 

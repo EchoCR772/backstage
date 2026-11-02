@@ -7,6 +7,8 @@
 const L = {
   data: null, scanning: false, again: false, dirty: true,
   game: 'all', folders: null, kind: 'all', sort: 'new', q: '',
+  gameSort: 'recent',  // the games in the sidebar and Edit's Clips picker: 'recent' (newest clip first) or 'alpha'
+  gq: '',              // the sidebar's game search
   months: true,        // split Newest/Oldest into month sections
   side: { w: 300, collapsed: false },
   folderOpen: false,   // the Folders panel in the sidebar
@@ -20,13 +22,14 @@ const L = {
 try {
   const p = JSON.parse(localStorage.getItem('library') || '{}');
   for (const k of ['game', 'kind', 'sort']) if (typeof p[k] === 'string') L[k] = p[k];
+  if (p.gameSort === 'alpha') L.gameSort = 'alpha';
   if (Array.isArray(p.folders)) L.folders = p.folders.filter(x => typeof x === 'string');
   if (typeof p.months === 'boolean') L.months = p.months;
   if (p.side) L.side = { w: Math.min(460, Math.max(220, +p.side.w || 300)), collapsed: !!p.side.collapsed };
   if (p.seen && typeof p.seen === 'object') L.seen = p.seen;
 } catch (e) { /* ignore */ }
 const saveLibPrefs = () => {
-  try { localStorage.setItem('library', JSON.stringify({ game: L.game, folders: L.folders, kind: L.kind, sort: L.sort, months: L.months, side: L.side, seen: L.seen })); } catch (e) { /* ignore */ }
+  try { localStorage.setItem('library', JSON.stringify({ game: L.game, folders: L.folders, kind: L.kind, sort: L.sort, gameSort: L.gameSort, months: L.months, side: L.side, seen: L.seen })); } catch (e) { /* ignore */ }
 };
 
 const KINDS = [
@@ -58,7 +61,7 @@ $('libtab').onclick = () => showLibrary();
 $('navback').onclick = () => navInput(-1, true);
 $('navfwd').onclick = () => navInput(1, true);
 let appVersion = '';
-T.settingsGet().then(r => { if (r.ok) { appVersion = r.version; L.deleteMode = r.deleteMode; } });
+T.settingsGet().then(r => { if (r.ok) { appVersion = r.version; L.deleteMode = r.deleteMode; L.editSave = r.editSave; } });
 // the test copy says so, in the title bar and the window title
 window.APP_TITLE = T.isTest ? `${T.appName} (Test build)` : T.appName;
 if (T.isTest) $('testbadge').hidden = false;
@@ -179,7 +182,7 @@ async function changelogBox() {
   const body = document.querySelector('.modal-ov:last-child .modal-body');
   const list = await releasesBetween(null, null, null);
   if (!body || !body.isConnected) return;
-  if (!list) { body.replaceChildren(h('p', '', "Couldn't reach GitHub. "), (() => { const a = h('button', 'linkbtn', 'Open the releases page'); a.onclick = () => T.openUrl('https://github.com/EchoCR772/clip-editor/releases'); return a; })()); return; }
+  if (!list) { body.replaceChildren(h('p', '', "Couldn't reach GitHub. "), (() => { const a = h('button', 'linkbtn', 'Open the releases page'); a.onclick = () => T.openUrl('https://github.com/EchoCR772/backstage/releases'); return a; })()); return; }
   body.replaceChildren(...list.flatMap(r => releaseNodes(r)));
   body.classList.add('updnotes');
 }
@@ -207,22 +210,94 @@ function infoBox(title, body) {
   x.onclick = done;
   ov.addEventListener('pointerdown', e => { if (e.target === ov && e.button === 0) done(); });
 }
+// ---------- reports: a problem, and replies to the ones sent ----------
+let reportsUnread = 0;
+function showReportsDot() { $('appmenu').classList.toggle('dot', reportsUnread > 0); }
+T.onReports(n => {
+  const more = n > reportsUnread;
+  reportsUnread = n; showReportsDot();
+  if (more) libToast(`You have a reply to a report. Help > My Reports.`, null, 8000);
+});
+T.reportsList(false).then(r => { if (r.ok) { reportsUnread = r.unread; showReportsDot(); } });
+// a dialog with our own buttons; returns { box, body, done }
+function dialog(title, cls = '') {
+  hideMenu(); hideTip();
+  const ov = h('div', 'modal-ov'), box = h('div', 'modal wide ' + cls);
+  const x = h('button', 'modal-x'); x.append(icoSpan('x'));
+  const body = h('div', 'modal-body');
+  box.append(x, h('h2', '', title), body);
+  ov.append(box); document.body.append(ov);
+  requestAnimationFrame(() => ov.classList.add('on'));
+  const done = () => { document.removeEventListener('keydown', key, true); ov.classList.remove('on'); setTimeout(() => ov.remove(), 160); };
+  const key = e => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') { if (e.key === 'Escape') { e.preventDefault(); done(); } e.stopPropagation(); return; }
+    e.stopPropagation(); if (e.key === 'Escape') { e.preventDefault(); done(); }
+  };
+  document.addEventListener('keydown', key, true);
+  x.onclick = done;
+  ov.addEventListener('pointerdown', e => { if (e.target === ov && e.button === 0) done(); });
+  return { box, body, done };
+}
+async function problemBox() {
+  const { box, body, done } = dialog('Report a problem', 'report');
+  const what = h('textarea', 'modal-in report-ta'); what.rows = 4; what.placeholder = 'What happened? (what you expected, and what you got instead)'; what.maxLength = 4000;
+  const doing = h('textarea', 'modal-in report-ta'); doing.rows = 2; doing.placeholder = 'What were you doing when it happened? (optional)'; doing.maxLength = 2000;
+  const inc = h('label', 'report-check'); const cb = h('input'); cb.type = 'checkbox'; cb.checked = true;
+  inc.append(cb, document.createTextNode(' Include the app\'s log and PC details (Windows version, graphics card, settings)'));
+  const pre = h('pre', 'report-pre'); pre.hidden = true; pre.textContent = 'Loading...';
+  const see = h('button', 'linkbtn', "See what's sent"); see.onclick = () => { pre.hidden = !pre.hidden; see.textContent = pre.hidden ? "See what's sent" : "Hide what's sent"; };
+  body.append(what, doing, inc, see, pre, h('p', 'report-note', 'Your Windows username is taken out of everything first. No clips or pictures are sent. Replies show up in Help > My Reports.'));
+  const row = h('div', 'modal-btns');
+  const cancel = h('button', 'mbtn', 'Cancel'), send = h('button', 'mbtn primary', 'Send');
+  row.append(cancel, send); box.append(row);
+  cancel.onclick = done;
+  what.focus();
+  const d = await T.problemDetails();
+  pre.textContent = d.ok ? d.text : d.error;
+  if (d.ok && !d.ready) { send.disabled = true; body.append(h('p', 'report-note warn', "Reports aren't switched on in this version yet.")); }
+  send.onclick = async () => {
+    if (what.value.trim().length < 5) { what.focus(); libToast('Say what happened first.', 'err'); return; }
+    send.disabled = true; send.textContent = 'Sending...';
+    const r = await T.problemSend({ what: what.value, doing: doing.value, details: cb.checked });
+    if (!r.ok) { send.disabled = false; send.textContent = 'Send'; libToast(r.error, 'err'); return; }
+    done(); libToast('Sent. Thanks! Replies show up in Help > My Reports.');
+  };
+}
+async function reportsBox() {
+  const { body, done } = dialog('My reports', 'reports');
+  body.append(h('p', '', 'Checking for replies...'));
+  const r = await T.reportsList(true);
+  body.replaceChildren();
+  if (!r.ok) { body.append(h('p', '', r.error)); return; }
+  if (!r.reports.length) body.append(h('p', '', r.ready ? "You haven't sent any reports yet. Help > Report a Problem sends one." : "Reports aren't switched on in this version yet."));
+  for (const x of r.reports.slice().reverse()) {
+    const card = h('div', 'rep' + (x.unread ? ' new' : ''));
+    const head = h('div', 'rep-head');
+    head.append(h('b', '', x.title || (x.kind === 'recorder' ? 'Recording software info' : 'Problem')), h('span', 'rep-state ' + x.state, x.state === 'closed' ? 'Closed' : 'Open'));
+    card.append(head, h('div', 'rep-sub', `${x.kind === 'recorder' ? 'Recording software info' : 'Problem'} #${x.n}  ·  sent ${new Date(x.at).toLocaleString()}`));
+    if (!x.replies.length) card.append(h('div', 'rep-none', 'No reply yet.'));
+    for (const y of x.replies) { const rp = h('div', 'rep-reply'); rp.append(h('div', 'rep-when', new Date(y.at).toLocaleString()), ...mdNodes(y.body)); card.append(rp); }
+    body.append(card);
+  }
+  await T.reportsSeen();
+  reportsUnread = 0; showReportsDot();
+}
 function aboutBox() {
   const link = (text, url) => { const a = h('button', 'linkbtn', text); a.onclick = () => T.openUrl(url); return a; };
   const p = (...kids) => { const e = h('p'); e.append(...kids); return e; };
   infoBox(`${T.appName} ${appVersion}`, [
     p('Trim and share your NVIDIA and Discord clips. Made by Echo.'),
-    p(link('github.com/EchoCR772/clip-editor', 'https://github.com/EchoCR772/clip-editor')),
+    p(link('github.com/EchoCR772/backstage', 'https://github.com/EchoCR772/backstage')),
     h('h3', '', 'Open-source parts'),
     p('FFmpeg (GPL v3), used to read and make videos. Source: ', link('ffmpeg.org', 'https://ffmpeg.org/download.html'), ', build: ', link('ffmpeg-static', 'https://github.com/eugeneware/ffmpeg-static')),
-    p('Mediabunny (MPL 2.0), Electron (MIT), electron-updater (MIT). Full notices: ', link('THIRD_PARTY_NOTICES', 'https://github.com/EchoCR772/clip-editor/blob/main/THIRD_PARTY_NOTICES.md')),
+    p('Mediabunny (MPL 2.0), Electron (MIT), electron-updater (MIT). Full notices: ', link('THIRD_PARTY_NOTICES', 'https://github.com/EchoCR772/backstage/blob/main/THIRD_PARTY_NOTICES.md')),
   ]);
 }
 
 function shortcutsBox() {
   const rows = [['Ctrl+O', 'Open a video'], ['Ctrl+B', 'Show / hide Your Library'], ['Ctrl+= / - / 0', 'Zoom in / out / actual size'], ['F11', 'Full screen'], ['Ctrl+V', 'Open a video copied in File Explorer'], ['Ctrl+F', 'Search'], ['Ctrl+A', 'Select all clips'], ['Delete', 'Delete the selected clips'],
     ['F2', 'Rename'], ['Alt+Left / Right', 'Back / forward'], ['Ctrl+,', 'Settings'], ['', ''], ['Space', 'Play / pause (editor)'], ['I  O', 'Set start / end at the playhead'],
-    [',  .', 'One frame back / forward'], ['J  L', 'Back / forward 10 seconds'], ['Home  End', 'Start / end of the trim'], ['Ctrl+C', 'Copy the trimmed clip'], ['Esc', 'Close']];
+    [',  .', 'One frame back / forward'], ['J  L', 'Back / forward 10 seconds'], ['Home  End', 'Start / end of the trim'], ['Ctrl+C', 'Copy the trimmed clip'], ['Esc', 'Deselect'], ['Ctrl+W', 'Close the clip']];
   hideMenu();
   const ov = h('div', 'modal-ov'), box = h('div', 'modal wide');
   const x = h('button', 'modal-x'); x.append(icoSpan('x'));
@@ -254,7 +329,7 @@ $('appmenu').onclick = e => {
       '-',
       { text: 'Settings', hint: 'Ctrl+Comma', run: () => openSettings() },
       '-',
-      { text: 'Close Clip', hint: 'Esc', run: () => window.closeActiveTab(), disabled: !ed },
+      { text: 'Close Clip', hint: 'Ctrl+W', run: () => window.closeActiveTab(), disabled: !ed },
       { text: 'Exit', hint: 'Alt+F4', run: () => window.close() },
     ] },
     { text: 'Edit', sub: [
@@ -266,7 +341,7 @@ $('appmenu').onclick = e => {
       { text: 'Select All', hint: 'Ctrl+A', run: () => selectAll(), disabled: ed },
       { text: 'Clear Selection', hint: 'Esc', run: () => clearSel(), disabled: ed || !sel.length },
       '-',
-      { text: 'Find...', hint: 'Ctrl+F', run: () => { showLibrary(); $('libsearch').focus(); $('libsearch').select(); } },
+      { text: 'Find...', hint: 'Ctrl+F', run: () => showLibrary().then(() => { $('libsearch').focus(); $('libsearch').select(); }) },
     ] },
     { text: 'View', sub: [
       { text: 'Your Library', hint: 'Ctrl+B', check: !L.side.collapsed, run: () => toggleSidebar() },
@@ -295,6 +370,10 @@ $('appmenu').onclick = e => {
         : upd.state === 'available' ? { text: `Update to ${upd.version}...`, run: updateBox }
         : { text: upd.state === 'downloading' ? `Downloading Update... ${upd.progress || 0}%` : 'Check for Updates...', run: checkUpdates, disabled: upd.state === 'downloading' || upd.state === 'checking' },
       { text: 'Changelog', run: changelogBox },
+      '-',
+      { text: 'Report a Problem...', run: problemBox },
+      { text: reportsUnread ? `My Reports (${reportsUnread} new)` : 'My Reports', run: reportsBox },
+      '-',
       { text: `About ${T.appName}`, run: aboutBox },
     ] },
   ]);
@@ -302,9 +381,9 @@ $('appmenu').onclick = e => {
   $('appmenu').classList.add('open');
 };
 // the library's name sits in the middle of the title bar; clicking it (or Home) closes the editor
-function showLibrary() {
+async function showLibrary() {
   closeSettings();
-  if (window.qtHide) window.qtHide();
+  if (window.qtHide && !(await window.qtHide())) return; // kept editing (unsaved changes)
   $('libtab').classList.add('active');
   if (L.dirty || !L.data) loadLibrary();
   document.title = window.APP_TITLE;
@@ -336,7 +415,8 @@ function showNavButtons() {
   $('navback').disabled = H.i <= 0;
   $('navfwd').disabled = H.i >= H.list.length - 1;
 }
-function navGo(d) {
+async function navGo(d) {
+  if (window.qtCanLeave && !(await window.qtCanLeave())) return;
   clearTimeout(H.timer);
   for (let j = H.i + d; j >= 0 && j < H.list.length; j += d) {
     const s = H.list[j];
@@ -390,7 +470,8 @@ async function loadLibrary() {
   } else libEmpty(r.error);
   if (L.again) { L.again = false; loadLibrary(); }
 }
-T.onLibChanged(() => { if (!$('library').classList.contains('away')) loadLibrary(); else L.dirty = true; });
+// also while the editor is open: its clip list is the library's list, so a newly saved clip shows up there
+T.onLibChanged(() => loadLibrary());
 T.onLibProgress(n => { if (!L.data) libEmpty(`Reading your clips... ${n}`); });
 window.addEventListener('beforeunload', () => { leaveView(); saveLibPrefs(); });
 
@@ -415,6 +496,7 @@ function renderLibrary(update) {
   renderFolders();
   renderSide();
   renderGrid(false, update);
+  if (window.qtListChanged) window.qtListChanged(true); // the editor's clip list, keeping its scroll position
 }
 
 // right-click a folder in the Folders panel
@@ -465,7 +547,7 @@ async function reportCard(dir) {
   const see = h('button', 'btn sm primary', "See what's sent");
   const btns = h('div', 'rc-btns'); btns.append(see);
   card.append(x, h('div', 'rc-title', 'Help add this recording software?'),
-    h('div', 'rc-text', `Send how ${srcLabel(f)} stores its clips, so Clip Editor can find it automatically for everyone. You'll see exactly what's sent first.`), btns);
+    h('div', 'rc-text', `Send how ${srcLabel(f)} stores its clips, so Backstage can find it automatically for everyone. You'll see exactly what's sent first.`), btns);
   document.body.append(card);
   const place = () => {
     const row = [...document.querySelectorAll('#folderlist .frow')].find(e => samePathR(e.title, dir));
@@ -593,7 +675,8 @@ function showTip(el, text, pos) {
   }
   else {
     x = r.left + r.width / 2 - w / 2; y = r.top - ht - 8;
-    if (y < 4) y = r.bottom + 8; // no room above: show it below
+    // no room above, or it would land in the title bar (Windows draws its buttons over it): show it below
+    if (y < 4 || (r.top >= 40 && y < 42)) y = r.bottom + 8;
   }
   t.style.left = Math.max(6, Math.min(x, innerWidth - w - 6)) + 'px';
   t.style.top = Math.max(4, Math.min(y, innerHeight - ht - 4)) + 'px';
@@ -646,11 +729,13 @@ window.addEventListener('blur', hideTip);
 applySide();
 function applySide() {
   $('library').style.setProperty('--sidew', (L.side.collapsed ? 80 : L.side.w) + 'px');
+  document.documentElement.style.setProperty('--sidew', (L.side.collapsed ? 80 : L.side.w) + 'px'); // the editor page sits beside it
   $('libside').classList.toggle('collapsed', L.side.collapsed);
   if (L.side.collapsed) { L.folderOpen = false; $('folderbox').classList.remove('open'); }
   $('sidetoggle').dataset.tip = L.side.collapsed ? 'Open Your Library' : 'Collapse Your Library';
   $('sidetoggle').dataset.tipPos = L.side.collapsed ? 'right' : '';
   if (tip.el === $('sidetoggle')) showTip($('sidetoggle'));
+  if (window.qtSideChanged) window.qtSideChanged(); // the editor's clip list goes with it
 }
 function toggleSidebar() { L.side.collapsed = !L.side.collapsed; applySide(); saveLibPrefs(); }
 $('sidetoggle').onclick = toggleSidebar;
@@ -737,21 +822,177 @@ function renderSide() {
   };
   // clicking the one you're on does nothing (All clips) or goes back to all clips (a game)
   const pick = key => () => {
+    // from the editor: back to the library, on the game clicked
+    // in the editor the games filter its clip list (the same way they filter the library)
+    if (window.qtIsOpen && window.qtIsOpen()) {
+      if (key === L.game && key !== 'all') key = 'all';
+      if (key !== L.game) { L.game = key; saveLibPrefs(); renderSide(); renderGrid(true); if (window.qtListChanged) window.qtListChanged(); }
+      return;
+    }
     if (key === L.game) { if (key === 'all') { showLibrary(); return; } key = 'all'; }
     L.game = key; saveLibPrefs(); renderSide(); renderGrid(true); showLibrary();
   };
   const here = d.clips.filter(inFolders);
+  // Home: back to the big cards (from the editor), or to the top of them
+  const home = h('div', 'game home');
+  home.dataset.railTip = 'Home';
+  const ht = h('div', 'gtext'); ht.append(h('span', 'gname', 'Home'));
+  home.append(iconAvatar('home', '#1a191c'), ht);
+  home.onclick = () => { if (window.qtIsOpen && window.qtIsOpen()) showLibrary(); else $('libscroll').scrollTo({ top: 0, behavior: 'smooth' }); };
+  top.append(home);
   // All clips stays put above the games, which scroll on their own; a line separates them
-  top.append(row('All clips', here.length, iconAvatar('grid', '#1a191c'), L.game === 'all', pick('all')));
-  // games with no clips in the chosen folders aren't listed
-  const games = gamesOf(here);
-  if (games.length) top.append(h('div', 'gdiv'));
+  const all = row('All clips', here.length, iconAvatar('grid', '#1a191c'), L.game === 'all', pick('all'));
+  all.classList.add('allclips');
+  top.append(all, h('div', 'gdiv'));
+  // games with no clips in the chosen folders aren't listed; the search box narrows them down
+  const games = sortGames(gamesOf(here)).filter(g => gameMatch(g, L.gq));
   for (const g of games) {
     const r = row(g.name, g.count, avatar(g.name, g.latestPath), L.game === g.key, pick(g.key));
     r.addEventListener('contextmenu', e => gameMenu(e, g));
     box.append(r);
   }
+  if (!games.length && L.gq) box.append(h('div', 'gempty', 'No games match'));
+  $('gsorttext').textContent = L.gameSort === 'alpha' ? 'A-Z' : 'Recent';
 }
+
+// ---------- finding a game: search and sort (the sidebar and Edit's Clips picker) ----------
+// sorted by name (numbers in order, case ignored), or as gamesOf gives them (newest clip first)
+const sortGames = games => (L.gameSort === 'alpha' ? games.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })) : games);
+// "dead" finds Deadlock, "cod" finds Call of Duty (first letters of the words), "2" finds Destiny 2
+function gameMatch(g, q) {
+  q = String(q || '').trim().toLowerCase();
+  if (!q) return true;
+  const name = g.name.toLowerCase();
+  if (name.includes(q)) return true;
+  const flat = name.replace(/[^a-z0-9]+/g, ''), qq = q.replace(/[^a-z0-9]+/g, '');
+  if (qq && flat.includes(qq)) return true;
+  const initials = name.split(/[^a-z0-9]+/).filter(Boolean).map(w => w[0]).join('');
+  return !!qq && initials.startsWith(qq);
+}
+function gameSortMenu(btn, after) {
+  const m = $('ctxmenu');
+  if (!m.hidden && m.dataset.for === 'gsort') { hideMenu(); return; }
+  const r = btn.getBoundingClientRect();
+  openMenu(r.right, r.bottom + 6, [['recent', 'Recent'], ['alpha', 'Alphabetical']].map(([k, label]) => ({
+    icon: L.gameSort === k ? 'check' : 'blank', text: label, cls: L.gameSort === k ? 'cur' : '',
+    run: () => { L.gameSort = k; saveLibPrefs(); renderSide(); if (after) after(); },
+  })), true, 'gsort');
+  btn.classList.add('open');
+}
+// the sidebar: a search button that opens into a box (like Spotify's Your Library), and the sort button
+function openGameSearch() {
+  if (L.side.collapsed) { L.side.collapsed = false; applySide(); saveLibPrefs(); }
+  $('gsearchin').focus();
+}
+function closeGameSearch() {
+  $('gsearchin').value = '';
+  if (L.gq) { L.gq = ''; renderSide(); }
+}
+$('gsearchbtn').onclick = openGameSearch;
+$('gsearchin').addEventListener('input', () => { L.gq = $('gsearchin').value; renderSide(); $('games').scrollTop = 0; });
+$('gsearchin').addEventListener('keydown', e => {
+  if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeGameSearch(); $('gsearchin').blur(); }
+  else if (e.key === 'Enter') { const first = $('games').querySelector('.game'); if (first) first.click(); }
+});
+$('gsearchx').addEventListener('pointerdown', e => e.preventDefault()); // keeps the box focused
+$('gsearchx').onclick = e => { e.preventDefault(); closeGameSearch(); $('gsearchin').focus(); };
+$('gsortbtn').onclick = e => { e.stopPropagation(); gameSortMenu($('gsortbtn')); };
+
+// Edit's Clips tab: a button showing the game the clip list is on; it opens a list of the games with
+// a search box and the sort button. Picking one filters the clip list like the sidebar does.
+function fillGamePick(btn) {
+  if (!btn || !L.data) return;
+  const here = L.data.clips.filter(inFolders);
+  const g = L.game === 'all' ? null : gamesOf(here).find(x => x.key === L.game);
+  const av = g ? avatar(g.name, g.latestPath) : iconAvatar('grid', '#1a191c');
+  const txt = h('div', 'gtext');
+  txt.append(h('span', 'gname', g ? g.name : 'All clips'), h('span', 'gcount', `${g ? g.count : here.length} clip${(g ? g.count : here.length) === 1 ? '' : 's'}`));
+  const chev = icoSpan('chev'); chev.classList.add('chev');
+  btn.replaceChildren(av, txt, chev);
+}
+window.fillGamePick = fillGamePick;
+let pickerShutAt = 0;
+function closeGamePicker() {
+  const p = $('gpicker');
+  if (!p) return;
+  p.remove();
+  document.querySelectorAll('.gpick.open').forEach(b => b.classList.remove('open'));
+}
+function openGamePicker(anchor) {
+  if ($('gpicker')) { closeGamePicker(); return; }
+  if (Date.now() - pickerShutAt < 400 || !L.data) return; // the click on its button that just closed it
+  hideMenu(); hideTip();
+  const here = L.data.clips.filter(inFolders);
+  const p = h('div', 'gpicker'); p.id = 'gpicker';
+  const box = h('label', 'search');
+  const input = h('input'); input.type = 'text'; input.placeholder = 'Search games'; input.spellcheck = false;
+  box.append(icoSpan('search'), input);
+  const sort = h('button', 'ibtn gpsort'); sort.id = 'gpsort'; sort.append(icoSpan('sort'));
+  sort.dataset.tip = 'Sort';
+  const top = h('div', 'gp-top'); top.append(box, sort);
+  const list = h('div', 'gp-list');
+  p.append(top, list);
+  let hi = 0;
+  const choose = key => {
+    closeGamePicker();
+    if (key !== L.game) { L.game = key; saveLibPrefs(); renderSide(); renderGrid(true); if (window.qtListChanged) window.qtListChanged(); }
+  };
+  const mark = () => list.querySelectorAll('.gp-row').forEach((r, i) => { r.classList.toggle('hi', i === hi); if (i === hi) r.scrollIntoView({ block: 'nearest' }); });
+  const fill = () => {
+    const q = input.value;
+    const rows = [];
+    const row = (key, name, count, av) => {
+      const r = h('div', 'gp-row' + (key === L.game ? ' on' : ''));
+      const txt = h('div', 'gtext'); txt.append(h('span', 'gname', name), h('span', 'gcount', `${count} clip${count === 1 ? '' : 's'}`));
+      r.append(av, txt);
+      if (key === L.game) r.append(icoSpan('check'));
+      r.onclick = () => choose(key);
+      r.addEventListener('mousemove', () => { const i = rows.indexOf(r); if (i !== hi) { hi = i; mark(); } });
+      rows.push(r);
+    };
+    if (!q.trim()) row('all', 'All clips', here.length, iconAvatar('grid', '#1a191c'));
+    for (const g of sortGames(gamesOf(here)).filter(x => gameMatch(x, q))) row(g.key, g.name, g.count, avatar(g.name, g.latestPath));
+    list.replaceChildren(...rows);
+    if (!rows.length) list.append(h('div', 'gempty', 'No games match'));
+    hi = Math.max(0, rows.findIndex(r => r.classList.contains('on')));
+    if (q.trim()) hi = 0;
+    mark();
+  };
+  input.addEventListener('input', fill);
+  input.addEventListener('keydown', e => {
+    const rows = list.querySelectorAll('.gp-row');
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); if (rows.length) { hi = (hi + (e.key === 'ArrowDown' ? 1 : -1) + rows.length) % rows.length; mark(); } }
+    else if (e.key === 'Enter') { e.preventDefault(); if (rows[hi]) rows[hi].click(); }
+    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeGamePicker(); }
+  });
+  sort.onclick = e => { e.preventDefault(); e.stopPropagation(); gameSortMenu(sort, () => { fill(); input.focus(); }); };
+  document.body.append(p);
+  const r = anchor.getBoundingClientRect();
+  const w = Math.max(r.width, 300);
+  p.style.left = Math.max(8, Math.min(r.left, innerWidth - w - 8)) + 'px';
+  p.style.top = (r.bottom + 6) + 'px';
+  p.style.width = w + 'px';
+  p.style.maxHeight = Math.max(200, innerHeight - r.bottom - 22) + 'px';
+  anchor.classList.add('open');
+  fill();
+  input.focus();
+}
+window.openGamePicker = openGamePicker;
+// a click outside the picker closes it, and only that (like the menus); its sort menu counts as inside
+document.addEventListener('pointerdown', e => {
+  const p = $('gpicker');
+  if (!p || p.contains(e.target) || $('ctxmenu').contains(e.target)) return;
+  const onAnchor = e.target.closest && e.target.closest('.gpick');
+  closeGamePicker();
+  if (onAnchor) pickerShutAt = Date.now();
+  if (e.button !== 0 || onAnchor) return;
+  e.stopPropagation();
+  const eat = ev => { ev.stopPropagation(); ev.preventDefault(); };
+  window.addEventListener('click', eat, { capture: true, once: true });
+  setTimeout(() => window.removeEventListener('click', eat, true), 600);
+}, true);
+window.addEventListener('blur', closeGamePicker);
+window.addEventListener('resize', closeGamePicker);
 
 // ---------- grid ----------
 function scope() {
@@ -871,7 +1112,7 @@ function showMore(n = 60, fresh) {
       L.lastMonth = month;
     }
     const kept = L.reuse && L.reuse.get(c.path);
-    if (kept && kept._clip.size === c.size) { refreshCard(kept, c); L.cards.append(kept); continue; }
+    if (kept && thumbStamp(kept._clip) === thumbStamp(c)) { refreshCard(kept, c); L.cards.append(kept); continue; }
     // only what's on screen when a folder opens waves in; everything further down is simply
     // there by the time you scroll to it
     const wave = fresh && i - first < 15;
@@ -888,13 +1129,30 @@ function showMore(n = 60, fresh) {
 const moreObs = new IntersectionObserver(es => { if (es.some(e => e.isIntersecting)) showMore(); }, { root: $('libscroll'), rootMargin: '2000px' });
 $('libscroll').addEventListener('scroll', hideMenu, { passive: true });
 
+// a round arrow that slides down over the top of a scrolled list and takes it back up
+function backToTop(sc) {
+  const b = h('button', 'totop');
+  b.title = 'Back to the top';
+  b.append(icoSpan('up'));
+  b.onclick = () => sc.scrollTo({ top: 0, behavior: 'smooth' });
+  sc.parentElement.append(b);
+  sc.addEventListener('scroll', () => { b.style.top = (sc.offsetTop + 10) + 'px'; b.classList.toggle('show', sc.scrollTop > 240); }, { passive: true });
+}
+backToTop($('games'));
+backToTop($('libscroll'));
+
+// A picture is kept for one version of the file (its size and time): a clip that was still being
+// written when it was first seen (Encore saves a replay in a few seconds) gets a new one once it's done.
+const thumbStamp = c => `${c.size}:${c.mtime || 0}`;
+function knownThumb(c) { const t = L.thumbs.get(c.path); return t && t.stamp === thumbStamp(c) ? t : null; }
+function keepThumb(c, r) { if (r) r.stamp = thumbStamp(c); L.thumbs.set(c.path, r); }
 function loadThumb(el) {
   if (el._thumbing) return Promise.resolve();
   el._thumbing = true;
   thumbObs.unobserve(el);
-  const c = el._clip, known = L.thumbs.get(c.path);
+  const c = el._clip, known = knownThumb(c);
   if (known) { paintCard(el, known); return Promise.resolve(); }
-  return T.libThumb(c.path).then(r => { L.thumbs.set(c.path, r); paintCard(el, r); });
+  return T.libThumb(c.path).then(r => { keepThumb(c, r); paintCard(el, r); });
 }
 const thumbObs = new IntersectionObserver(es => {
   for (const e of es) if (e.isIntersecting) loadThumb(e.target);
@@ -1147,9 +1405,9 @@ async function copyClips(list) {
   const r = await T.copyClips(list.map(c => c.path));
   clearTimeout(slow);
   if (!r.ok) return libToast(r.error, 'err');
-  const big = r.files.filter(f => f.size > 10 * 1048576).length;
+  const big = r.files.filter(f => f.size > 20 * 1048576).length;
   const what = list.length === 1 ? 'Copied' : `Copied ${list.length} clips`;
-  libToast(big ? `${what}. ${big === 1 && list.length === 1 ? `It's ${fmtSize(r.files[0].size)}, so` : `${big} of them are over 10 MB, so`} Discord needs Nitro to send ${big === 1 ? 'it' : 'them'}.` : `${what}. Paste into Discord with Ctrl+V.`);
+  libToast(big ? `${what}. ${big === 1 && list.length === 1 ? `It's ${fmtSize(r.files[0].size)}, so` : `${big} of them are over 20 MB, so`} Discord needs Nitro to send ${big === 1 ? 'it' : 'them'}.` : `${what}. Paste into Discord with Ctrl+V.`);
 }
 
 // cards fade in one after another in reading order (a wave), however the pictures happen to load
@@ -1171,7 +1429,7 @@ function paintCard(el, r) {
     // ffmpeg couldn't read it; the built-in player often can, so take the frame from there
     r.triedPlayer = true;
     playerThumb(el._clip).then(x => {
-      if (x && x.url) { L.thumbs.set(el._clip.path, x); paintCard(el, x); } else paintCard(el, r);
+      if (x && x.url) { keepThumb(el._clip, x); paintCard(el, x); } else paintCard(el, r);
     });
   } else {
     el.classList.add('noimg');
@@ -1325,11 +1583,11 @@ function fillMenu(m, items) {
     m.append(b);
   }
 }
-function openMenu(x, y, items, alignRight) {
+function openMenu(x, y, items, alignRight, forName) {
   stopPreview();
   closeSub();
   const m = $('ctxmenu');
-  m.dataset.for = '';
+  m.dataset.for = forName || ''; // set before measuring: some menus are narrower (CSS by data-for)
   fillMenu(m, items);
   m.hidden = false;
   const r = m.getBoundingClientRect();
@@ -1368,7 +1626,7 @@ function showMenu(x, y, c, el) {
     { icon: 'trash', text: 'Delete', run: () => trashClips([c]), cls: 'danger' },
   ]);
 }
-const MENU_BUTTONS = ['appmenu', 'libsort', 'qtsavemenu', 'qtcopymenu', 'qtmore']; // buttons that open a menu; clicking one again closes it
+const MENU_BUTTONS = ['appmenu', 'libsort', 'gsortbtn', 'gpsort', 'qtsavemenu', 'qtcopymenu', 'qtmore']; // buttons that open a menu; clicking one again closes it
 function hideMenu() { $('ctxmenu').hidden = true; closeSub(); for (const id of MENU_BUTTONS) { const b = $(id); if (b) b.classList.remove('open'); } }
 // While any menu is open, a click outside it only closes it (like Discord): clicking the button that
 // opened it closes it, and clicking a card doesn't also open the clip. Every menu goes through
@@ -1455,6 +1713,30 @@ function confirmBox({ title, body, ok = 'Delete', danger = true, value, placehol
   });
 }
 const promptBox = o => confirmBox({ danger: false, ...o, value: o.value ?? '' });
+// a question with several answers: buttons [{ text, value, cls }] left to right (the last one is
+// the default for Enter); Esc, the x and clicking outside answer null
+function choiceBox({ title, body, buttons }) {
+  return new Promise(resolve => {
+    hideTip(); hideMenu();
+    const ov = h('div', 'modal-ov'), box = h('div', 'modal choice');
+    const x = h('button', 'modal-x'); x.append(icoSpan('x')); x.setAttribute('aria-label', 'Close');
+    const row = h('div', 'modal-btns n' + buttons.length);
+    const done = v => { document.removeEventListener('keydown', key, true); ov.classList.remove('on'); setTimeout(() => ov.remove(), 160); resolve(v); };
+    const els = buttons.map(b => { const el = h('button', 'mbtn ' + (b.cls || ''), b.text); el.onclick = () => done(b.value); row.append(el); return el; });
+    const key = e => {
+      e.stopPropagation();
+      if (e.key === 'Escape') { e.preventDefault(); done(null); }
+      else if (e.key === 'Enter' && document.activeElement && document.activeElement.parentElement !== row) { e.preventDefault(); done(buttons[buttons.length - 1].value); }
+    };
+    box.append(x, h('h2', '', title), h('p', '', body), row);
+    ov.append(box); document.body.append(ov);
+    requestAnimationFrame(() => ov.classList.add('on'));
+    document.addEventListener('keydown', key, true);
+    x.onclick = () => done(null);
+    ov.addEventListener('pointerdown', e => { if (e.target === ov && e.button === 0) done(null); });
+    els[els.length - 1].focus();
+  });
+}
 
 async function trashClips(list) {
   if (!list.length) return;
@@ -1710,6 +1992,19 @@ async function renderSettings() {
     dlc.append(row);
   }
   dls.append(dlc);
+
+  // saving edits made in the editor's Edit view (Trim always saves as you go)
+  L.editSave = r.editSave;
+  const svs = section('Saving edits', 'How changes made in Edit are kept. Trims made in Trim always save as you go.');
+  const esc = h('div', 'setcard');
+  for (const [id, name, note] of [['manual', 'Save Changes or Cancel', 'Edit has Cancel and Save Changes buttons, and asks before leaving with unsaved changes.'], ['auto', 'Save automatically', 'Changes save as you make them; Edit just has Back to Trim.']]) {
+    const row = h('button', 'setrow setopt' + (r.editSave === id ? ' on' : ''));
+    const t = h('div', 'settext'); t.append(h('div', 'setname', name), h('div', 'setpath wrap', note));
+    row.append(h('span', 'radio'), t);
+    row.onclick = async () => { if (r.editSave === id) return; await T.settingsSet({ editSave: id }); L.editSave = id; if (window.qtSaveModeChanged) window.qtSaveModeChanged(); renderSettings(); };
+    esc.append(row);
+  }
+  svs.append(esc);
 
   // updates
   const us = section('Updates', 'New versions come from the GitHub releases page.');

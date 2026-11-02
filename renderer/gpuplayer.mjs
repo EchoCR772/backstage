@@ -185,7 +185,7 @@ export class GpuPlayer {
     const gen = this.gen;
     let i = 0;
     for await (const s of sink.samplesAtTimestamps(times)) {
-      if (this.closed) { if (s) s.close(); return; }
+      if (this.closed) { if (s) s.close(); return; } // (closing disposes the input; the caller catches what that throws)
       if (s) { draw(i, s); s.close(); }
       i++;
       if (gen !== this.gen && this.playing) await sleep(30); // give playback room

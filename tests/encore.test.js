@@ -65,7 +65,7 @@ const audioCount = f => execFileSync('/usr/bin/ffprobe', ['-v', 'error', '-selec
     await w.fill('#qtin', '1'); await w.press('#qtin', 'Enter'); await w.fill('#qtout', '3'); await w.press('#qtout', 'Enter'); await w.waitForTimeout(400);
     const est = await sizeText(), m = est.match(/≈ ([\d.]+) (MB|GB) \(from ([\d.]+) (MB|GB)\)/);
     check(!!m && Math.abs(parseFloat(m[1]) / parseFloat(m[3]) - 1 / 3) < 0.05, 'trimmed clip shows about a third of the size (2 s of 6 s)', est);
-    await w.keyboard.press('Escape'); await w.waitForTimeout(600);
+    await w.click('.game.home'); await w.waitForTimeout(600);
     check(/≈ /.test(await w.$eval('.clip .csub', e => e.textContent)), 'trimmed card shows the estimated size', await w.$eval('.clip .csub', e => e.textContent));
 
     // untouched exports

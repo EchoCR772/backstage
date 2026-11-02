@@ -49,15 +49,18 @@ async function launch({ name = 'run', library = LIB, gpu = false, keepProfile = 
   const app = await _electron.launch({
     executablePath: require(path.join(ROOT, 'node_modules', 'electron')),
     args: [ROOT, '--user-data-dir=' + ud, ...gpuFlags],
-    env: { ...process.env, ELECTRON_DISABLE_SANDBOX: '1', CLIP_TRIMMER_LIBRARY: library.join(path.delimiter), CLIP_TRIMMER_EXPORTS: ex,
+    env: { ...process.env, ELECTRON_DISABLE_SANDBOX: '1', BACKSTAGE_LIBRARY: library.join(path.delimiter), BACKSTAGE_EXPORTS: ex,
       // the Linux ffmpeg-static build crashes on MPEG-TS (smart cut); the system one is fine
-      ...(process.platform === 'linux' && fs.existsSync('/usr/bin/ffmpeg') ? { CLIP_TRIMMER_FFMPEG: '/usr/bin/ffmpeg' } : {}) },
+      ...(process.platform === 'linux' && fs.existsSync('/usr/bin/ffmpeg') ? { BACKSTAGE_FFMPEG: '/usr/bin/ffmpeg' } : {}) },
   });
   const w = await app.firstWindow();
   const errs = [];
-  w.on('pageerror', e => errs.push(String(e.stack || e).slice(0, 400)));
+  w.on('pageerror', e => { errs.push(String(e.stack || e).slice(0, 400)); if (process.env.CT_TRACE) console.log('PAGEERROR', String(e.stack || e).slice(0, 800)); });
   w.on('console', m => { if (m.type() === 'error' && !/No available adapters/.test(m.text())) errs.push('console: ' + m.text()); });
   await w.setViewportSize({ width: 1500, height: 920 });
+  // closing at the end never stops on the editor's unsaved-changes question
+  const close = app.close.bind(app);
+  app.close = async () => { await w.evaluate(() => { window.qtDirty = () => false; }).catch(() => {}); return close(); };
   await w.waitForSelector('.clip', { timeout: 20000 });
   await w.waitForTimeout(1200);
   return { app, w, errs, ud, ex };
@@ -66,7 +69,7 @@ async function launch({ name = 'run', library = LIB, gpu = false, keepProfile = 
 // tiny assertion helper: collects failures instead of stopping at the first
 function checker(testName) {
   const fails = [];
-  const check = (ok, what, got) => { if (!ok) fails.push(`${what}${got !== undefined ? ` (got ${JSON.stringify(got)})` : ''}`); };
+  const check = (ok, what, got) => { if (process.env.CT_TRACE) console.log((ok ? 'ok   ' : 'FAIL ') + what); if (!ok) fails.push(`${what}${got !== undefined ? ` (got ${JSON.stringify(got)})` : ''}`); };
   const done = () => {
     if (fails.length) { console.log(`FAIL ${testName}\n  - ` + fails.join('\n  - ')); process.exitCode = 1; }
     else console.log(`PASS ${testName}`);
