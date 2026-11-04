@@ -22,6 +22,7 @@ const L = {
 try {
   const p = JSON.parse(localStorage.getItem('library') || '{}');
   for (const k of ['game', 'kind', 'sort']) if (typeof p[k] === 'string') L[k] = p[k];
+  if (p.oldExportsSeen) L.oldExportsSeen = true;
   if (p.gameSort === 'alpha') L.gameSort = 'alpha';
   if (Array.isArray(p.folders)) L.folders = p.folders.filter(x => typeof x === 'string');
   if (typeof p.months === 'boolean') L.months = p.months;
@@ -29,25 +30,32 @@ try {
   if (p.seen && typeof p.seen === 'object') L.seen = p.seen;
 } catch (e) { /* ignore */ }
 const saveLibPrefs = () => {
-  try { localStorage.setItem('library', JSON.stringify({ game: L.game, folders: L.folders, kind: L.kind, sort: L.sort, gameSort: L.gameSort, months: L.months, side: L.side, seen: L.seen })); } catch (e) { /* ignore */ }
+  try { localStorage.setItem('library', JSON.stringify({ game: L.game, folders: L.folders, kind: L.kind, sort: L.sort, gameSort: L.gameSort, months: L.months, side: L.side, seen: L.seen, oldExportsSeen: L.oldExportsSeen })); } catch (e) { /* ignore */ }
 };
 
-const KINDS = [
-  ['all', 'All'], ['discord', 'Discord'], ['replay', 'Instant Replay'], ['recording', 'Recordings'], ['trim', 'Trimmed'],
-];
-const KIND_BADGE = { discord: 'Clip', replay: 'Instant Replay', recording: 'Recording', trim: 'Trimmed' };
+// The filters above the cards (Nov 4, his call): Clips are the short saved moments (Discord clips,
+// NVIDIA Instant Replay, Encore Echoes), Recordings the full ones, Edited anything Backstage made or
+// changed: exports, replaced originals, clips with a saved trim or edit.
+const KINDS = [['all', 'All'], ['clip', 'Clips'], ['recording', 'Recordings'], ['edited', 'Edited']];
+if (!KINDS.some(([k]) => k === L.kind)) L.kind = 'all'; // saved from before 1.49.0, when they went by app
+const isEdited = c => !!(c.edited || c.edit);
+const kindHas = (c, k) => k === 'all' || (k === 'edited' ? isEdited(c) : c.type === k);
+const KIND_BADGE = { discord: 'Clip', replay: 'Instant Replay', echo: 'Echo', recording: 'Recording', export: 'Export' };
 const SRC_LOOK = {
   nvidia: { label: 'NVIDIA', icon: 'gamepad', color: '#1e1e1e', img: 'img/nvidia.png' },
   discord: { label: 'Discord', icon: 'chat', color: '#1e1e1e', img: 'img/discord.png' },
   encore: { label: 'Encore', icon: 'gamepad', color: '#1e1e1e', img: 'img/encore.png' },
   folder: { label: '', icon: 'folder', color: '#2e2d31' },
-  trimmed: { label: 'Trimmed', icon: 'scissors', color: '#1f8b4c' },
+  trimmed: { label: 'Old exports', icon: 'scissors', color: '#1f8b4c' },
 };
 const samePathR = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
 const h = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
-const fmtWhen = ms => new Date(ms).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
-const fmtMonth = ms => new Date(ms).toLocaleString(undefined, { month: 'long', year: 'numeric' });
-const isToday = ms => new Date(ms).toDateString() === new Date().toDateString();
+// (one formatter each: making a new one per call was a good part of what a card cost)
+const WHEN = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+const MONTH = new Intl.DateTimeFormat(undefined, { month: 'long', year: 'numeric' });
+const fmtWhen = ms => WHEN.format(new Date(ms));
+const fmtMonth = ms => MONTH.format(new Date(ms));
+const isToday = ms => { const a = new Date(ms), b = new Date(); return a.getDate() === b.getDate() && a.getMonth() === b.getMonth() && a.getFullYear() === b.getFullYear(); };
 const fmtLen = s => { s = Math.round(s); const m = Math.floor(s / 60); return m >= 60 ? `${Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}` : `${m}:${String(s % 60).padStart(2, '0')}`; };
 const hue = s => { let x = 0; for (const c of s) x = (x * 31 + c.charCodeAt(0)) | 0; return Math.abs(x) % 360; };
 const folderName = p => p.split(/[\\/]/).filter(Boolean).pop() || p;
@@ -61,7 +69,7 @@ $('libtab').onclick = () => showLibrary();
 $('navback').onclick = () => navInput(-1, true);
 $('navfwd').onclick = () => navInput(1, true);
 let appVersion = '';
-T.settingsGet().then(r => { if (r.ok) { appVersion = r.version; L.deleteMode = r.deleteMode; L.editSave = r.editSave; } });
+T.settingsGet().then(r => { if (r.ok) { appVersion = r.version; L.deleteMode = r.deleteMode; L.editSave = r.editSave; L.renameFiles = r.renameFiles; } });
 // the test copy says so, in the title bar and the window title
 window.APP_TITLE = T.isTest ? `${T.appName} (Test build)` : T.appName;
 if (T.isTest) $('testbadge').hidden = false;
@@ -109,8 +117,28 @@ $('updbtn').onclick = () => {
   else if (upd.state === 'available') updateBox();
 };
 
+// The updater brings the notes as GitHub's HTML (&gt; for >): back to the same Markdown, as text
+// only. Tags are dropped and entities decoded by hand, nothing is ever parsed as HTML.
+const ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', '#39': "'" };
+function htmlNotes(text) {
+  const t = String(text || '');
+  if (!/<\/?[a-z][^>]*>|&[#a-z0-9]+;/i.test(t)) return t;
+  return t.replace(/\r/g, '')
+    .replace(/<h[1-6][^>]*>/gi, '\n## ').replace(/<\/h[1-6]>/gi, '\n')
+    .replace(/<li[^>]*>/gi, '\n- ').replace(/<br\s*\/?>|<\/p>|<\/li>|<\/ul>|<\/ol>/gi, '\n')
+    .replace(/<\/?(strong|b)>/gi, '**').replace(/<\/?code>/gi, '`')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&(#x[0-9a-f]+|#\d+|[a-z]+|#39);/gi, (m, e) => {
+      const k = e.toLowerCase();
+      if (ENTITIES[k] !== undefined) return ENTITIES[k];
+      const n = k[0] === '#' ? (k[1] === 'x' ? parseInt(k.slice(2), 16) : parseInt(k.slice(1), 10)) : NaN;
+      return Number.isFinite(n) && n > 0 && n < 0x110000 ? String.fromCodePoint(n) : m;
+    })
+    .replace(/\n(?:[ \t]*\n)+(?=[ \t]*- )/g, '\n'); // one list stays one list
+}
 // Release notes are short Markdown (headings, "- " lists, **bold**, `code`); turned into elements, never HTML.
 function mdNodes(text) {
+  text = htmlNotes(text);
   const out = []; let list = null;
   const inline = str => {
     const e = h('p');
@@ -264,7 +292,7 @@ async function problemBox() {
   };
 }
 async function reportsBox() {
-  const { body, done } = dialog('My reports', 'reports');
+  const { body } = dialog('My reports', 'reports');
   body.append(h('p', '', 'Checking for replies...'));
   const r = await T.reportsList(true);
   body.replaceChildren();
@@ -318,14 +346,12 @@ $('appmenu').onclick = e => {
   const m = $('ctxmenu');
   if (!m.hidden && m.dataset.for === 'appmenu') { hideMenu(); return; }
   const r = $('appmenu').getBoundingClientRect();
-  const edit = document.activeElement && document.activeElement.tagName === 'INPUT';
   const ed = window.qtIsOpen && window.qtIsOpen(), q = window.qtApi;
   const sel = L.sel.size ? selected() : [];
   openMenu(r.left, r.bottom + 6, [
     { text: 'File', sub: [
       { text: 'Open Video...', hint: 'Ctrl+O', run: () => pickFile() },
       { text: 'Add Clips Folder...', run: async () => folderAdded(await T.libAddFolder()) },
-      { text: 'Open Trimmed Folder', run: async () => { const x = await T.exportOpenDir(); if (!x.ok) libToast(x.error, 'err'); } },
       '-',
       { text: 'Settings', hint: 'Ctrl+Comma', run: () => openSettings() },
       '-',
@@ -477,6 +503,7 @@ window.addEventListener('beforeunload', () => { leaveView(); saveLibPrefs(); });
 
 function libEmpty(text, withButton) {
   const box = $('libgrid');
+  V.rows = []; V.list = []; box.style.height = ''; box.classList.remove('virtual');
   box.replaceChildren();
   const d = h('div', 'libempty');
   d.append(h('div', '', text));
@@ -503,11 +530,8 @@ function renderLibrary(update) {
 function folderMenu(e, f) {
   e.preventDefault(); e.stopPropagation();
   const items = [{ text: 'Open in File Explorer', run: async () => { const x = await T.libOpenFolder(f.path); if (!x.ok) libToast(x.error, 'err'); } }];
-  if (f.kind === 'trimmed') items.push({ text: 'Change Folder...', run: async () => { const x = await T.exportPickDir(); if (!x.ok) libToast(x.error, 'err'); L.dirty = true; loadLibrary(); } });
-  else {
-    if (f.kind === 'folder') items.push({ text: 'Send Recording Software Info...', run: () => reportBox(f.path) });
-    items.push('-', { text: 'Remove from Library', cls: 'danger', run: () => removeFolder(f) });
-  }
+  if (f.kind === 'folder') items.push({ text: 'Send Recording Software Info...', run: () => reportBox(f.path) });
+  items.push('-', { text: 'Remove from Library', cls: 'danger', run: () => removeFolder(f) });
   openMenu(e.clientX, e.clientY, items);
 }
 // nothing is deleted: the folder just stops showing up (NVIDIA/Discord come back with "Use the detected folders")
@@ -608,11 +632,17 @@ async function reportBox(dir) {
 
 // ---------- which folders count (the Folders button in the sidebar) ----------
 const liveFolders = () => (L.data ? L.data.folders.filter(f => !f.missing) : []);
-// the chosen folders' paths: by default everything except the Trimmed folder
+// the chosen folders' paths: by default all of them (the old exports folder too, since 1.49.0: its
+// clips show under Edited)
 function chosenFolders() {
   const live = liveFolders();
-  let list = L.folders ? live.filter(f => L.folders.some(p => samePathR(p, f.path))) : live.filter(f => f.kind !== 'trimmed');
-  if (!list.length) list = live.filter(f => f.kind !== 'trimmed');
+  if (L.folders && !L.oldExportsSeen) {
+    // a saved choice from before 1.49.0 left the old exports folder out: put it in once
+    const old = live.find(f => f.kind === 'trimmed');
+    if (old && !L.folders.some(p => samePathR(p, old.path))) L.folders.push(old.path);
+    L.oldExportsSeen = true; saveLibPrefs();
+  }
+  let list = L.folders ? live.filter(f => L.folders.some(p => samePathR(p, f.path))) : live;
   if (!list.length) list = live;
   return list.map(f => f.path);
 }
@@ -832,7 +862,8 @@ function renderSide() {
     if (key === L.game) { if (key === 'all') { showLibrary(); return; } key = 'all'; }
     L.game = key; saveLibPrefs(); renderSide(); renderGrid(true); showLibrary();
   };
-  const here = d.clips.filter(inFolders);
+  // the filter above the cards (Clips, Recordings, Edited) narrows the games too
+  const here = d.clips.filter(c => inFolders(c) && kindHas(c, L.kind));
   // Home: back to the big cards (from the editor), or to the top of them
   const home = h('div', 'game home');
   home.dataset.railTip = 'Home';
@@ -902,7 +933,7 @@ $('gsortbtn').onclick = e => { e.stopPropagation(); gameSortMenu($('gsortbtn'));
 // a search box and the sort button. Picking one filters the clip list like the sidebar does.
 function fillGamePick(btn) {
   if (!btn || !L.data) return;
-  const here = L.data.clips.filter(inFolders);
+  const here = L.data.clips.filter(c => inFolders(c) && kindHas(c, L.kind));
   const g = L.game === 'all' ? null : gamesOf(here).find(x => x.key === L.game);
   const av = g ? avatar(g.name, g.latestPath) : iconAvatar('grid', '#1a191c');
   const txt = h('div', 'gtext');
@@ -922,7 +953,7 @@ function openGamePicker(anchor) {
   if ($('gpicker')) { closeGamePicker(); return; }
   if (Date.now() - pickerShutAt < 400 || !L.data) return; // the click on its button that just closed it
   hideMenu(); hideTip();
-  const here = L.data.clips.filter(inFolders);
+  const here = L.data.clips.filter(c => inFolders(c) && kindHas(c, L.kind));
   const p = h('div', 'gpicker'); p.id = 'gpicker';
   const box = h('label', 'search');
   const input = h('input'); input.type = 'text'; input.placeholder = 'Search games'; input.spellcheck = false;
@@ -1000,7 +1031,7 @@ function scope() {
 }
 function filtered(base) {
   const q = L.q.trim().toLowerCase();
-  let list = base.filter(c => L.kind === 'all' || c.kind === L.kind);
+  let list = base.filter(c => kindHas(c, L.kind));
   if (q) list = list.filter(c => (c.gameName + ' ' + c.name + ' ' + c.sub + ' ' + (c.title || '')).toLowerCase().includes(q));
   const dur = c => { const t = L.thumbs.get(c.path); return (t && t.duration) || c.duration || 0; };
   const by = {
@@ -1048,24 +1079,28 @@ function libTitle() {
   }
 }
 
+function pickKind(k) {
+  if (k === L.kind) return; // All while on All: nothing moves
+  L.kind = k; saveLibPrefs(); renderSide(); renderGrid(true);
+  if (window.qtListChanged) window.qtListChanged();
+}
 function renderGrid(resetScroll, update) {
   const d = L.data;
   if (!d) return;
   enterView();
   libTitle();
   const base = scope();
-  // type chips: only the kinds that are here
+  // the filters: only ones that pick out some of what's here, not none or all of it. Clicking the one
+  // that's on turns it off; the sidebar's games follow it.
   const chips = $('libkinds');
   chips.replaceChildren();
-  const have = new Set(base.map(c => c.kind));
-  if (L.kind !== 'all' && !have.has(L.kind)) L.kind = 'all';
-  // only worth showing when there's more than one kind to pick between
-  if (KINDS.filter(([k]) => k !== 'all' && have.has(k)).length < 2) L.kind = 'all';
-  else {
-    for (const [k, label] of KINDS) {
-      if (k !== 'all' && !have.has(k)) continue;
+  const count = k => base.reduce((n, c) => n + (kindHas(c, k) ? 1 : 0), 0);
+  if (L.kind !== 'all' && !count(L.kind)) { L.kind = 'all'; saveLibPrefs(); renderSide(); }
+  const show = KINDS.filter(([k]) => k !== 'all' && (k === L.kind || (count(k) > 0 && count(k) < base.length)));
+  if (show.length) {
+    for (const [k, label] of [KINDS[0], ...show]) {
       const c = h('button', 'chip' + (L.kind === k ? ' on' : ''), label);
-      c.onclick = () => { L.kind = k; saveLibPrefs(); renderGrid(true); };
+      c.onclick = () => pickKind(L.kind === k ? 'all' : k);
       chips.append(c);
     }
   }
@@ -1081,52 +1116,98 @@ function renderGrid(resetScroll, update) {
   stopPreview();
   const box = $('libgrid');
   const keep = resetScroll ? 0 : $('libscroll').scrollTop;
-  const want = resetScroll ? 60 : Math.max(60, L.shown);
-  // cards that are still there are moved into the new layout instead of being made again, so a
-  // refresh (a new clip saved, a rename) doesn't make every picture blink
-  const old = new Map();
-  if (update) for (const el of box.querySelectorAll('.clip')) old.set(el._clip.path, el);
-  box.replaceChildren();
-  L.shown = 0; L.lastMonth = null; L.cards = null; L.reuse = old;
+  // a new view (another game, a filter) makes its cards again, so the first screen waves in; a
+  // refresh keeps the cards whose clip hasn't changed, so nothing blinks
+  if (!update) { V.els.clear(); box.replaceChildren(); }
+  else for (const [p, el] of V.els) { const c = L.list.find(x => x.path === p); if (!c || thumbStamp(el._clip) !== thumbStamp(c)) { el.remove(); V.els.delete(p); } else refreshCard(el, c); }
   if (!d.folders.some(x => !x.missing)) return libEmpty("Couldn't find a clips folder. Add the folder your clips are saved in.", true);
   if (!d.clips.length) return libEmpty('No clips in your folders yet.', true);
   if (!L.list.length) return libEmpty(L.q ? `No clips match "${L.q}".` : 'No clips here.');
-  showMore(want, !update);
-  L.reuse = null;
+  box.querySelector('.libempty')?.remove();
+  V.fresh = !update; V.t0 = performance.now(); V.waved = 0;
+  layoutGrid();
   $('libscroll').scrollTop = keep;
-}
-
-// cards are added in batches as you scroll
-function showMore(n = 60, fresh) {
-  const box = $('libgrid');
-  const byDate = (L.sort === 'new' || L.sort === 'old') && L.months;
-  const end = Math.min(L.list.length, L.shown + n);
-  const t0 = performance.now(), first = L.shown;
-  for (let i = L.shown; i < end; i++) {
-    const c = L.list[i];
-    const month = byDate ? (isToday(c.date) ? 'Today' : fmtMonth(c.date)) : '';
-    if (!L.cards || month !== L.lastMonth) {
-      if (byDate) box.append(h('h4', 'month', month));
-      L.cards = h('div', 'cards');
-      box.append(L.cards);
-      L.lastMonth = month;
-    }
-    const kept = L.reuse && L.reuse.get(c.path);
-    if (kept && thumbStamp(kept._clip) === thumbStamp(c)) { refreshCard(kept, c); L.cards.append(kept); continue; }
-    // only what's on screen when a folder opens waves in; everything further down is simply
-    // there by the time you scroll to it
-    const wave = fresh && i - first < 15;
-    const el = card(c, wave);
-    if (wave) el._waveAt = t0 + (i - first) * 45; // 45 ms apart
-    L.cards.append(el);
-  }
-  L.shown = end;
-  let s = $('libmore');
-  if (s) s.remove();
-  if (L.shown < L.list.length) { s = h('div'); s.id = 'libmore'; box.append(s); moreObs.observe(s); }
+  paintGrid();
   backgroundThumbs();
 }
-const moreObs = new IntersectionObserver(es => { if (es.some(e => e.isIntersecting)) showMore(); }, { root: $('libscroll'), rootMargin: '2000px' });
+
+// ---------- the home grid: virtual scrolling ----------
+// Only the rows on screen (and some above and below) have cards; the rest of the grid is empty
+// space worked out from the scroll position, so scrolling stays smooth however many clips there
+// are, and whatever card you land on is there to click. Cards that scroll away are kept (up to
+// V_KEEP) with their pictures, so scrolling back is instant. Cards only wave in when a view opens
+// (V.fresh): while scrolling they're simply there, no fade.
+const V = { rows: [], list: [], height: 0, cols: 1, cw: 310, ch: 232, els: new Map(), heads: new Map(), fresh: false, t0: 0, waved: 0, raf: 0 };
+const V_GAP = 18, V_MIN = 310, V_OVER = 900, V_KEEP = 360;
+let vHeadH = 0;
+function layoutGrid() {
+  const box = $('libgrid');
+  box.classList.add('virtual');
+  const W = box.clientWidth || 1000;
+  if (!vHeadH) { const m = h('h4', 'month', 'May 2026'); m.style.visibility = 'hidden'; box.append(m); const cs = getComputedStyle(m); vHeadH = m.offsetHeight + parseFloat(cs.marginTop) + parseFloat(cs.marginBottom); m.remove(); }
+  V.w = W; V.cols = Math.max(1, Math.floor((W + V_GAP) / (V_MIN + V_GAP)));
+  V.cw = (W - V_GAP * (V.cols - 1)) / V.cols; V.ch = V.cw * 3 / 4;
+  const byDate = (L.sort === 'new' || L.sort === 'old') && L.months;
+  V.list = L.list; V.rows = [];
+  let y = 0, i = 0;
+  while (i < L.list.length) {
+    // one month (or everything when not sorted by date)
+    const month = byDate ? (isToday(L.list[i].date) ? 'Today' : fmtMonth(L.list[i].date)) : '';
+    let j = i;
+    while (j < L.list.length && (!byDate || (isToday(L.list[j].date) ? 'Today' : fmtMonth(L.list[j].date)) === month)) j++;
+    if (byDate) { V.rows.push({ head: month, y }); y += vHeadH; }
+    for (let k = i; k < j; k += V.cols) { V.rows.push({ from: k, to: Math.min(j, k + V.cols), y }); y += V.ch + V_GAP; }
+    y -= V_GAP; // no gap under a month's last row (the next heading has its own space)
+    i = j;
+  }
+  V.height = Math.max(0, y);
+  box.style.height = V.height + 'px';
+}
+function paintGrid() {
+  const box = $('libgrid'), sc = $('libscroll');
+  if (!V.rows.length) return;
+  const top = box.getBoundingClientRect().top - sc.getBoundingClientRect().top; // the grid's top, on screen
+  const y0 = -top - V_OVER, y1 = -top + sc.clientHeight + V_OVER;
+  const want = new Set(), heads = new Set();
+  const firstOnScreen = V.rows.find(r => r.y + (r.head ? vHeadH : V.ch) > -top);
+  for (const r of V.rows) {
+    const rh = r.head ? vHeadH : V.ch;
+    if (r.y + rh < y0) continue;
+    if (r.y > y1) break;
+    if (r.head) {
+      heads.add(r.head);
+      let el = V.heads.get(r.head);
+      if (!el) { el = h('h4', 'month vhead', r.head); V.heads.set(r.head, el); }
+      el.style.top = r.y + 'px';
+      if (el.parentNode !== box) box.append(el);
+      continue;
+    }
+    for (let i = r.from; i < r.to; i++) {
+      const c = V.list[i], col = (i - r.from);
+      want.add(c.path);
+      let el = V.els.get(c.path);
+      if (!el) {
+        // only the first screen of a new view waves in
+        const wave = V.fresh && V.waved < 15 && firstOnScreen && r.y < -top + sc.clientHeight;
+        el = card(c, wave);
+        if (wave) el._waveAt = V.t0 + (V.waved++) * 45; // 45 ms apart
+        V.els.set(c.path, el);
+      } else if (el._clip !== c || !el.parentNode) { refreshCard(el, c); el.classList.toggle('sel', L.sel.has(c.path)); } // (badges and names may have changed while it was away)
+      el.style.left = col * (V.cw + V_GAP) + 'px'; el.style.top = r.y + 'px'; el.style.width = V.cw + 'px';
+      if (el.parentNode !== box) box.append(el);
+      if (!el._thumbing) loadThumb(el);
+    }
+  }
+  V.fresh = false; // after the first paint, new cards are just there
+  // off-screen cards leave the page; the most recent ones are kept for coming back
+  for (const [p, el] of V.els) if (!want.has(p) && el.parentNode) { if (preview.el === el) stopPreview(); el.remove(); }
+  for (const [k, el] of V.heads) if (!heads.has(k) && el.parentNode) el.remove();
+  if (V.els.size > V_KEEP) for (const p of V.els.keys()) { if (V.els.size <= V_KEEP) break; if (!want.has(p)) V.els.delete(p); }
+}
+const queuePaint = () => { if (!V.raf) V.raf = requestAnimationFrame(() => { V.raf = 0; paintGrid(); }); };
+$('libscroll').addEventListener('scroll', queuePaint, { passive: true });
+// (watches the scroll box, not the grid: the grid's own height is set here, which would loop)
+new ResizeObserver(() => requestAnimationFrame(() => { if (!V.rows.length) return; const w = $('libgrid').clientWidth; if (w && w !== V.w) { V.w = w; layoutGrid(); paintGrid(); } })).observe($('libscroll'));
 $('libscroll').addEventListener('scroll', hideMenu, { passive: true });
 
 // a round arrow that slides down over the top of a scrolled list and takes it back up
@@ -1161,11 +1242,17 @@ const thumbObs = new IntersectionObserver(es => {
 let bgThumbs = 0;
 function backgroundThumbs() {
   const run = ++bgThumbs;
+  let i = 0;
   const next = () => {
     if (run !== bgThumbs) return;
-    const el = [...$('libgrid').querySelectorAll('.clip')].find(x => !x._thumbing);
-    if (!el) return;
-    loadThumb(el).then(() => (window.requestIdleCallback ? requestIdleCallback(next, { timeout: 300 }) : setTimeout(next, 16)));
+    while (i < V.list.length && knownThumb(V.list[i])) i++;
+    const c = V.list[i++];
+    if (!c) return;
+    T.libThumb(c.path).then(r => {
+      keepThumb(c, r);
+      const el = V.els.get(c.path); if (el && el.isConnected && !el._thumbing) loadThumb(el);
+      return window.requestIdleCallback ? requestIdleCallback(next, { timeout: 300 }) : setTimeout(next, 16);
+    });
   };
   setTimeout(next, 600); // after the first screen has had its turn
 }
@@ -1187,6 +1274,22 @@ $('libscroll').addEventListener('scroll', () => {
     if (cardEl && cardEl !== preview.el) schedulePreview(cardEl, cardEl._clip);
   }, 160);
 }, { passive: true });
+// a click while the cards are still ignoring the mouse (right after scrolling) still opens the card
+// under it: the scrolling state ends on the press and the click goes to that card
+let scrollPress = null;
+$('libscroll').addEventListener('pointerdown', e => {
+  const g = $('libgrid');
+  scrollPress = null;
+  if (!g.classList.contains('scrolling') || e.button !== 0) return;
+  clearTimeout(scrollIdle);
+  g.classList.remove('scrolling');
+  const hit = document.elementsFromPoint(e.clientX, e.clientY).find(x => x.closest && x.closest('#libgrid .clip'));
+  scrollPress = hit ? hit.closest('#libgrid .clip') : null;
+}, true);
+$('libscroll').addEventListener('click', e => {
+  const el = scrollPress; scrollPress = null;
+  if (el && el.isConnected && !(e.target.closest && e.target.closest('.clip'))) { e.stopPropagation(); el.dispatchEvent(new MouseEvent('click', { bubbles: true, ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, metaKey: e.metaKey })); }
+}, true);
 const mouseAt = { x: -1, y: -1 };
 window.addEventListener('pointermove', e => { mouseAt.x = e.clientX; mouseAt.y = e.clientY; }, { passive: true });
 
@@ -1420,7 +1523,7 @@ function paintCard(el, r) {
     const img = h('img');
     img.alt = '';
     img.draggable = false;
-    img.decoding = 'sync';
+    img.decoding = 'async';
     img.onerror = () => { img.remove(); el.classList.add('noimg'); showCard(el); };
     img.src = r.url;
     // only shown once the picture is decoded, so it never pops in half-drawn
@@ -1643,19 +1746,35 @@ document.addEventListener('pointerdown', e => {
 }, true);
 window.addEventListener('blur', hideMenu);
 
-// ---------- rename (only in the app; the file keeps its name) ----------
+// ---------- rename (in the app; the file too with Settings > File names) ----------
 async function renameClip(c) {
-  const t = await promptBox({ title: 'Rename clip', body: 'The name is used in the app and for copies and exports. The file itself keeps its name.', value: c.title || '', placeholder: clipTitle({ date: c.date }), ok: 'Save' });
+  const body = L.renameFiles ? 'The video file is renamed too (Settings > File names). The name is also used for exports and copies.'
+    : 'The name is used in the app and for exports and copies. The file itself keeps its name (Settings > File names can change that).';
+  const t = await promptBox({ title: 'Rename clip', body, value: c.title || '', placeholder: clipTitle({ date: c.date }), ok: 'Save' });
   if (t === null) return;
   setClipTitle(c, t);
 }
 async function setClipTitle(c, t) {
-  const r = await T.renameClip(c.path, t);
+  const from = c.path;
+  const r = await T.renameClip(from, t);
   if (!r.ok) return libToast(r.error, 'err');
   c.title = r.title;
   updateCardEdit(c);
-  if (window.qtTitleChanged) window.qtTitleChanged(c.path, r.title);
+  if (window.qtTitleChanged) window.qtTitleChanged(from, r.title);
+  if (r.path && !samePathR(r.path, from)) clipMoved({ from, to: r.path, name: r.name, url: r.url });
 }
+// a clip's file was renamed (Settings > File names): everything that knows it by its path follows
+function clipMoved({ from, to, name, url }) {
+  const move = c => { if (c && samePathR(c.path, from)) { c.path = to; c.name = name; c.url = url; } };
+  if (L.data) L.data.clips.forEach(move);
+  if (window.qtClipMoved) window.qtClipMoved(from, to, move);
+  if (L.thumbs.has(from)) { L.thumbs.set(to, L.thumbs.get(from)); L.thumbs.delete(from); }
+  for (const set of [L.sel, L.opened]) if (set.has(from)) { set.delete(from); set.add(to); }
+  if (V.els.has(from)) { V.els.get(from).remove(); V.els.delete(from); }
+  if (L.data) renderGrid(false, true);
+}
+T.onClipMoved(clipMoved);
+window.clipMovedHere = clipMoved;
 
 // after deleting clips or a game folder (Recycle Bin or for good, per Settings)
 function afterTrash(r, what) {
@@ -1904,8 +2023,8 @@ async function renderSettings() {
     const open = h('button', 'btn sm ghost', 'Open');
     open.disabled = f.missing;
     open.onclick = async () => { const x = await T.libOpenFolder(f.path); if (!x.ok) libToast(x.error, 'err'); };
-    const rm = h('button', 'btn sm ghost', f.kind === 'trimmed' ? 'Change' : 'Remove');
-    rm.onclick = () => after(() => (f.kind === 'trimmed' ? T.exportPickDir() : T.libRemoveFolder(f.path)));
+    const rm = h('button', 'btn sm ghost', 'Remove');
+    rm.onclick = () => after(() => T.libRemoveFolder(f.path));
     row.append(iconAvatar(look.icon, look.color, look.img), txt, open, rm);
     list.append(row);
   }
@@ -1923,38 +2042,18 @@ async function renderSettings() {
   }
   fs.append(btns);
 
-  // trimmed clips
-  const xs = section('Trimmed clips', 'Exports are saved here, in a folder for each game, so your NVIDIA and Discord folders stay just your recordings. Tick "Trimmed" under Folders in the sidebar to see them. Export as... still lets you put one anywhere.');
-  const xc = h('div', 'setcard');
-  const xrow = h('div', 'setrow');
-  const xt = h('div', 'settext');
-  xt.append(h('div', 'setname', folderName(r.exportDir)), h('div', 'setpath', r.exportDir));
-  const xo = h('button', 'btn sm ghost', 'Open');
-  xo.onclick = async () => { const x = await T.exportOpenDir(); if (!x.ok) libToast(x.error, 'err'); };
-  const xch = h('button', 'btn sm ghost', 'Change');
-  xch.onclick = () => after(() => T.exportPickDir());
-  xrow.append(iconAvatar('scissors', '#1f8b4c'), xt, xo, xch);
-  xc.append(xrow);
-  const mrow = h('div', 'setrow');
-  const mt = h('div', 'settext', 'Looking for older trims...');
-  mrow.append(mt);
-  xc.append(mrow);
-  xs.append(xc);
-  T.oldTrims().then(o => {
-    if (!o.ok || !o.count) { mt.replaceChildren(h('div', 'setname', 'No trimmed clips left in your other folders')); return; }
-    mt.replaceChildren(h('div', 'setname', `${o.count} older trimmed clip${o.count === 1 ? '' : 's'} next to the originals`),
-      h('div', 'setpath', `${fmtSize(o.bytes)}. Move them into the trimmed folder so they're all in one place.`));
-    const mv = h('button', 'btn sm', 'Move them');
-    mv.onclick = async () => {
-      if (!(await confirmBox({ title: `Move ${o.count} trimmed clip${o.count === 1 ? '' : 's'}?`, body: `They go into ${r.exportDir}, sorted by game. Nothing is deleted.`, ok: 'Move', danger: false }))) return;
-      mv.disabled = true; mv.textContent = 'Moving...';
-      const y = await T.moveOldTrims();
-      if (!y.ok) libToast(y.error, 'err');
-      else libToast(y.failed.length ? `Moved ${y.moved}. Couldn't move: ${y.failed.join('; ')}` : `Moved ${y.moved} trimmed clip${y.moved === 1 ? '' : 's'}.`, y.failed.length ? 'err' : '');
-      L.dirty = true; L.thumbs.clear(); renderSettings();
-    };
-    mrow.append(mv);
-  });
+  // file names: Rename and Replace original can rename the file itself (off by default)
+  const fns = section('File names', 'Exports are saved next to the clip they come from. Names you give clips are used for exports and copies.');
+  const fnc = h('div', 'setcard');
+  for (const [id, name, note] of [[false, 'Keep the original file names', 'Renaming a clip only changes its name in Backstage.'],
+    [true, 'Rename the files too', 'Renaming a clip, or using Replace original on a named clip, renames the video file too, so you can find it outside Backstage. A clip open in the editor is renamed when you leave it.']]) {
+    const row = h('button', 'setrow setopt' + (r.renameFiles === id ? ' on' : ''));
+    const t = h('div', 'settext'); t.append(h('div', 'setname', name), h('div', 'setpath wrap', note));
+    row.append(h('span', 'radio'), t);
+    row.onclick = async () => { if (r.renameFiles === id) return; await T.settingsSet({ renameFiles: id }); L.renameFiles = id; renderSettings(); };
+    fnc.append(row);
+  }
+  fns.append(fnc);
 
   // Discord account
   const ds = section('Your Discord account', 'Used to label your own voice "You" in Discord clips. Found automatically from the clips you saved; set it here if it picks the wrong person.');

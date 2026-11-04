@@ -3,7 +3,10 @@
 ; It also removes the app's old install from when it was called Clip Editor (another app ID, so
 ; Windows treats it as a separate app): its own uninstaller runs quietly and keeps the user's data,
 ; which Backstage copies over the first time it starts (keepOldData in main.js).
+; (tools/test-installer-cleanup.ps1 sets a fake one to test this)
+!ifndef OLD_CLIP_EDITOR_GUID
 !define OLD_CLIP_EDITOR_GUID "e5818e60-f072-5809-a6c8-abb1226f8029"
+!endif
 
 !macro removeOldClipEditor
   ReadRegStr $R2 SHELL_CONTEXT "Software\${OLD_CLIP_EDITOR_GUID}" "InstallLocation"
@@ -25,6 +28,23 @@
     ${If} $R4 == "\Clip Editor"
       RMDir /r "$R2"
     ${EndIf}
+  ${EndIf}
+  ; The old uninstaller deletes its registry entries only after its files, and it can stop before
+  ; that: then "Clip Editor" stays under Installed apps, pointing at a folder that's gone. Once its
+  ; program really is gone, its entries go too (this also cleans PCs already on Backstage).
+  StrCpy $R5 "gone"
+  ${If} $R2 != ""
+  ${AndIf} ${FileExists} "$R2\Clip Editor.exe"
+    StrCpy $R5 "there"
+  ${EndIf}
+  ${If} ${FileExists} "$LOCALAPPDATA\Programs\Clip Editor\Clip Editor.exe"
+    StrCpy $R5 "there"
+  ${EndIf}
+  ${If} $R5 == "gone"
+    DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${OLD_CLIP_EDITOR_GUID}"
+    DeleteRegKey HKCU "Software\${OLD_CLIP_EDITOR_GUID}"
+    DeleteRegKey SHELL_CONTEXT "Software\Microsoft\Windows\CurrentVersion\Uninstall\${OLD_CLIP_EDITOR_GUID}"
+    DeleteRegKey SHELL_CONTEXT "Software\${OLD_CLIP_EDITOR_GUID}"
   ${EndIf}
 !macroend
 

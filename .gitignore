@@ -3,3 +3,4 @@ dist/
 tests/out/
 tools/enginetest/out/
 *.log
+.clip-links/

@@ -27,6 +27,8 @@ const FX = createFx({
   status: (...a) => status(...a), audioChanged: () => syncSounds(), canvas: () => $('qtcanvas'), info: () => Q.info,
   gainsChanged: () => applyGains(), canUndo: () => Q.hist.length > 0, canRedo: () => Q.future.length > 0,
   toggleRow: key => { const g = Q.groups.find(x => x.key === key); if (g) { g.mute = !g.mute; applyGains(); buildAudioRows(); FX.renderAll(); scheduleSave(); } },
+  // a sound row's volume from Edit's Properties (the side panel's slider shows the same)
+  rowVolume: (key, v) => { const g = Q.groups.find(x => x.key === key); if (g) { g.vol = v; if (v > 0) g.mute = false; applyGains(); buildAudioRows(); scheduleSave(); } },
   title: () => (Q.clip ? clipTitle(Q.clip) : ''),
   // V1's edges move the trim: the picture follows the edge while it's dragged
   trimMove: t => { Q.t = t; if (Q.player) Q.player.show(t); },
@@ -185,7 +187,7 @@ async function load(tab, el) {
   try {
     await audioReady;
     const specs = Q.groups.flatMap(g => g.idx.map(i => ({ key: 't' + i, path: c.path, index: i })))
-      .concat(FX.sounds().filter(x => !x.missing).map(soundSpec));
+      .concat(FX.sounds().filter(x => !x.missing).map(soundSpec), pieceSpecs(c.path));
     if (specs.length) Q.session = await window.ClipAudio.Session.open(specs, reader);
   } catch (err) { Q.session = null; status("The sound can't be previewed for this clip (the export still has it).", 'err', 8000); }
   if (gen !== Q.gen) { closeMedia(); return; }
@@ -200,16 +202,25 @@ async function load(tab, el) {
 }
 window.qtFx = FX; // tests reach the effects through this
 const soundSpec = x => ({ key: 's' + x.id, path: x.path, index: 0, offset: x.from - x.at, from: x.from, to: x.to });
-// the added sounds changed: the audio engine plays exactly those, where they are now
+// pieces of the clip's own sound rows (after a razor cut): each plays its part of every track in its row
+function pieceSpecs(path) {
+  const out = [];
+  for (const [k, c] of Object.entries(FX.cuts())) {
+    const g = Q.groups.find(x => x.key === k);
+    if (g) for (const p of c.pieces) for (const i of g.idx) out.push({ key: `p${p.id}:${i}`, path, index: i, offset: p.from - p.at, from: p.from, to: p.to, row: k, piece: p });
+  }
+  return out;
+}
+// the added sounds or the pieces changed: the audio engine plays exactly those, where they are now
 async function syncSounds() {
-  const snd = FX.sounds().filter(x => !x.missing);
-  if (!Q.session && snd.length) {
+  const specs = FX.sounds().filter(x => !x.missing).map(soundSpec).concat(Q.clip ? pieceSpecs(Q.clip.path) : []);
+  if (!Q.session && specs.length) {
     try { await audioReady; Q.session = await window.ClipAudio.Session.open([], reader); } catch (e) { return; }
   }
   if (Q.session) {
-    for (const key of [...Q.session.tracks.keys()]) if (key[0] === 's' && !snd.some(x => 's' + x.id === key)) Q.session.remove(key);
-    for (const x of snd) {
-      const sp = soundSpec(x), t = Q.session.tracks.get(sp.key);
+    for (const key of [...Q.session.tracks.keys()]) if ((key[0] === 's' || key[0] === 'p') && !specs.some(x => x.key === key)) Q.session.remove(key);
+    for (const sp of specs) {
+      const t = Q.session.tracks.get(sp.key);
       if (!t) await Q.session.add(sp);
       else if (t.offset !== sp.offset || t.from !== sp.from || t.to !== sp.to) Q.session.setWindow(sp.key, { offset: sp.offset, from: sp.from, to: sp.to });
     }
@@ -251,6 +262,12 @@ function subParts(c) {
   out.push(file);
   return out;
 }
+// a clip's file was renamed (Settings > File names): its tabs follow (the open clip is never renamed under the editor)
+window.qtClipMoved = (from, to, move) => {
+  for (const t of Q.tabs) move(t.clip);
+  if (Q.clip) move(Q.clip);
+  if (Q.visible) { renderClipList(true, true); if (Q.clip && samePathR(Q.clip.path, to)) showHead(); }
+};
 window.qtTitleChanged = (p, title) => {
   const t = findTab(p);
   if (t) t.clip.title = title;
@@ -724,10 +741,12 @@ async function loadStrip(gen, tab) {
   const ar = (Q.player.width || 16) / (Q.player.height || 9);
   const tw = hh * ar, n = Math.max(1, Math.ceil(w / tw));
   const times = Array.from({ length: n }, (_x, i) => Math.min(Q.dur - 0.05, (i + 0.5) * Q.dur / n));
-  await Q.player.thumbnails(times, (i, s) => {
-    if (gen !== Q.gen) return;
-    s.draw(g, Math.round(i * tw * dpr), 0, Math.ceil(tw * dpr), c.height);
-  });
+  try {
+    await Q.player.thumbnails(times, (i, s) => {
+      if (gen !== Q.gen) return;
+      s.draw(g, Math.round(i * tw * dpr), 0, Math.ceil(tw * dpr), c.height);
+    });
+  } catch (e) { return; } // the strip just stays as far as it got
   // kept with the tab, so switching back doesn't decode them again
   if (gen === Q.gen && tab) { try { tab.strip = await createImageBitmap(c); tab.stripW = w; } catch (e) { /* ignore */ } }
 }
@@ -832,7 +851,7 @@ function buildAudioRows() {
     const mute = h('button', 'ibtn sm qt-amute');
     mute.title = g.mute ? 'Unmute' : 'Mute';
     mute.append(icoSpan(g.mute ? 'speakerOff' : 'speaker'));
-    mute.onclick = () => { g.mute = !g.mute; applyGains(); buildAudioRows(); scheduleSave(); };
+    mute.onclick = () => { g.mute = !g.mute; applyGains(); buildAudioRows(); FX.renderAll(); scheduleSave(); };
     head.append(mute);
     row.append(head);
     if (g.open) {
@@ -840,6 +859,7 @@ function buildAudioRows() {
       const r = h('input'); r.type = 'range'; r.min = 0; r.max = 200; r.step = 5; r.value = Math.round(g.vol * 100);
       const v = h('span', '', Math.round(g.vol * 100) + '%');
       r.oninput = () => { g.vol = r.value / 100; v.textContent = r.value + '%'; if (g.vol > 0) g.mute = false; applyGains(); row.querySelector('.qt-avol').textContent = Math.abs(g.vol - 1) > 0.001 ? r.value + '%' : ''; scheduleSave(); };
+      r.onchange = () => { if (FX.selectedId() === 'row:' + g.key) FX.renderAll(); };
       r.ondblclick = () => { r.value = 100; r.oninput(); };
       sl.append(r, v);
       row.append(sl);
@@ -877,7 +897,7 @@ function buildAudioRows() {
   }
   const add = h('button', 'btn sm ghost qt-addaudio');
   add.append(icoSpan('plus'), document.createTextNode('Add audio'));
-  add.onclick = () => $('qttools').querySelector('[data-tool=audio]').click();
+  add.onclick = () => FX.useAsset('file:audio');
   box.append(add);
 }
 // volume points for a row: opens its track on the timeline
@@ -885,7 +905,8 @@ function ptsBtn(key) {
   const b = h('button', 'ibtn sm qt-apts' + (FX.allPts()[key] ? ' on' : ''));
   b.title = 'Volume points: change the volume over time on Edit\'s timeline';
   b.append(icoSpan('points'));
-  b.onclick = () => { if (Q.level !== 'edit') setLevel('edit'); FX.select(key.startsWith('s:') ? key.slice(2) : 'clip'); };
+  // in Edit, that row (or added sound) gets selected: its Properties say how to add points
+  b.onclick = () => { if (Q.level !== 'edit') setLevel('edit'); FX.select(key.startsWith('s:') ? key.slice(2) : 'row:' + key); };
   return b;
 }
 function nameRow(row, g) {
@@ -922,7 +943,10 @@ function applyGains() {
   let k = 1;
   if (fd.ain) k = Math.min(k, qclamp((t - Q.tin) / fd.ain, 0, 1));
   if (fd.aout) k = Math.min(k, qclamp((Q.tout - t) / fd.aout, 0, 1));
-  for (const g of Q.groups) for (const i of g.idx) Q.session.setGain('t' + i, g.mute ? 0 : g.vol * curveAt(vp[g.key], t) * k);
+  // a cut row plays through its pieces only
+  const cuts = FX.cuts();
+  for (const g of Q.groups) for (const i of g.idx) Q.session.setGain('t' + i, g.mute || cuts[g.key] ? 0 : g.vol * curveAt(vp[g.key], t) * k);
+  if (Object.keys(cuts).length) for (const sp of pieceSpecs('')) { const g = Q.groups.find(x => x.key === sp.row), p = sp.piece; Q.session.setGain(sp.key, g.mute || p.mute ? 0 : g.vol * (p.vol ?? 1) * curveAt(vp[g.key], t) * k); }
   for (const x of FX.sounds()) Q.session.setGain('s' + x.id, FX.aMuted(x) ? 0 : x.vol * curveAt(vp['s:' + x.id], t) * k);
 }
 
@@ -1013,7 +1037,7 @@ async function replaceOriginal() {
   pause();
   if (!(await confirmBox({
     title: 'Replace the original?',
-    body: `The original video will be permanently deleted. The trimmed clip (${fmtLen(Q.tout - Q.tin)}) takes its place with the same file name, date and audio tracks.`,
+    body: `The original video will be permanently deleted. The trimmed clip (${fmtLen(Q.tout - Q.tin)}) takes its place with the same ${L.renameFiles && Q.clip.title ? 'date and audio tracks, under the name "' + Q.clip.title + '"' : 'file name, date and audio tracks'}.`,
     ok: 'Replace',
   }))) return;
   const tab = Q.loaded, c = Q.clip;
@@ -1033,6 +1057,8 @@ async function replaceOriginal() {
   $('qtbar').hidden = true;
   if (Q.loaded !== tab) return;
   if (r.ok && !r.cancelled) {
+    // with Settings > File names it was renamed after the clip, too
+    if (r.path && !samePathR(r.path, c.path)) { const from = c.path; window.clipMovedHere({ from, to: r.path, name: r.name, url: r.url }); }
     c.size = r.size; c.duration = r.duration;
     c.edit = null;
     L.thumbs.delete(c.path);
@@ -1098,7 +1124,7 @@ $('qtmore').onclick = e => {
 
 // ---------- shortcuts ----------
 const KEYS = [['Space', 'Play / pause'], ['I  O', 'Set start / end at the playhead'],
-  ['E', 'Edit / back to Trim'], ['C Z T G S B D A', 'Edit: crop, zoom, text, picture, shape, blur, draw, add audio'], ['V  R', 'Edit: select / razor'], ['Del', 'Delete the selected effect'], ['Ctrl+Z', 'Undo'], ['Ctrl+Shift+Z', 'Redo'], [',  .', 'One frame back / forward'], ['←  →', 'One frame (Shift = 1 second)'],
+  ['E', 'Edit / back to Trim'], ['T G S A', 'Edit: text, picture, shape, add audio'], ['V  C', 'Edit: select / razor (cut)'], ['Del', 'Delete the selected effect'], ['Ctrl+Z', 'Undo'], ['Ctrl+Shift+Z', 'Redo'], [',  .', 'One frame back / forward'], ['←  →', 'One frame (Shift = 1 second)'],
   ['J  L', 'Back / forward 10 seconds'], ['Home  End', 'Jump to start / end of the trim'], ['F2', 'Rename'], ['Ctrl+C', 'Copy the trimmed clip'],
   ['Esc', 'Deselect'], ['Ctrl+W', 'Close the clip']];
 $('qthelp').onclick = e => {

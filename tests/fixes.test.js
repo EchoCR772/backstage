@@ -79,7 +79,7 @@ const { launch, checker, gopLibrary, OUT } = require('./helpers');
     const cv = await w.$eval('#qtcanvas', e => { const r = e.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; });
     const stroke = async dy => { await w.mouse.move(cv.x + cv.w * 0.3, cv.y + cv.h * dy); await w.mouse.down(); await w.mouse.move(cv.x + cv.w * 0.6, cv.y + cv.h * dy, { steps: 6 }); await w.mouse.up(); await w.waitForTimeout(350); };
     const strokes = async () => ((await fx()) || { layers: [] }).layers.filter(l => l.type === 'draw').reduce((n, l) => n + l.strokes.length, 0);
-    await w.click('#qttools [data-tool="draw"]'); await w.waitForTimeout(200);
+    await w.evaluate(() => window.qtFx.useAsset('fx:draw')); await w.waitForTimeout(200);
     await stroke(0.3); await stroke(0.5);
     await w.keyboard.press('Control+z'); await w.waitForTimeout(400);
     await stroke(0.7);
@@ -103,6 +103,11 @@ const { launch, checker, gopLibrary, OUT } = require('./helpers');
     const after = await lit();
     check(before > 0.5 && after > 0.5, 'right after scrolling the pictures are still there', [before, after]);
     check(await w.evaluate(() => window.qtFx.thumbCount()) >= kept, 'the decoded pictures are kept');
+
+    // the update dialog's fallback notes (the updater's HTML copy): no &gt; showing, lists kept
+    const notes = await w.evaluate(() => mdNodes('<h2>Fixes</h2>\n<ul>\n<li>Help &gt; Changelog works &amp; shows <strong>every</strong> version</li>\n<li>It&#39;s quicker</li>\n</ul>').map(n => [n.tagName, n.textContent]));
+    check(JSON.stringify(notes) === JSON.stringify([['H4', 'Fixes'], ['UL', 'Help > Changelog works & shows every versionIt\'s quicker']]), 'update notes from HTML read like the Markdown ones', notes);
+    check(await w.evaluate(() => mdNodes('- a > b & c').map(n => n.textContent).join()) === 'a > b & c', 'plain Markdown notes are left as they are');
   } catch (err) { check(false, 'test crashed: ' + (err.stack || err.message).slice(0, 500)); } finally {
     await app.close();
   }

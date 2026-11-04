@@ -112,7 +112,7 @@ const { launch, checker, openDiscordClip } = require('./helpers');
     check(/Copied/.test(await w.$eval('#libtoast', t => t.textContent)), 'card copy of a trimmed clip', await w.$eval('#libtoast', t => t.textContent));
 
     const files = fs.readdirSync(ex, { recursive: true }).map(String);
-    check(files.some(f => /Destiny 2[\\/].*_trim\.mp4$/.test(f)) && files.some(f => /_trim\.mp3$/.test(f)), 'files in the exports folder, by game', files);
+    check(files.some(f => /_trim\.mp4$/.test(f)) && files.some(f => /_trim\.mp3$/.test(f)), 'files in the exports folder', files);
     check(!errs.length, 'no page errors', errs);
   } catch (err) { check(false, 'test crashed: ' + err.message); } finally { await app.close(); done(); }
 })();

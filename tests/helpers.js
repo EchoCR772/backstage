@@ -38,7 +38,8 @@ function gopLibrary() {
   return [path.dirname(dir)];
 }
 
-async function launch({ name = 'run', library = LIB, gpu = false, keepProfile = false } = {}) {
+// ownExports false: exports go next to their clip, as in the real app (copy the library to tests/out first)
+async function launch({ name = 'run', library = LIB, gpu = false, keepProfile = false, ownExports = true } = {}) {
   const ud = path.join(OUT, 'profile-' + name);
   const ex = path.join(OUT, 'exports-' + name);
   if (!keepProfile) fs.rmSync(ud, { recursive: true, force: true });
@@ -49,7 +50,7 @@ async function launch({ name = 'run', library = LIB, gpu = false, keepProfile = 
   const app = await _electron.launch({
     executablePath: require(path.join(ROOT, 'node_modules', 'electron')),
     args: [ROOT, '--user-data-dir=' + ud, ...gpuFlags],
-    env: { ...process.env, ELECTRON_DISABLE_SANDBOX: '1', BACKSTAGE_LIBRARY: library.join(path.delimiter), BACKSTAGE_EXPORTS: ex,
+    env: { ...process.env, ELECTRON_DISABLE_SANDBOX: '1', BACKSTAGE_LIBRARY: library.join(path.delimiter), ...(ownExports ? { BACKSTAGE_EXPORTS: ex } : {}),
       // the Linux ffmpeg-static build crashes on MPEG-TS (smart cut); the system one is fine
       ...(process.platform === 'linux' && fs.existsSync('/usr/bin/ffmpeg') ? { BACKSTAGE_FFMPEG: '/usr/bin/ffmpeg' } : {}) },
   });

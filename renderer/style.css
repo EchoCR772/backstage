@@ -143,6 +143,10 @@ body.resizing *{user-select:none}
 
 /* ---------- clip cards: 4:3 like Discord's, with a smooth hover ---------- */
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:18px}
+/* the home grid is virtual (library.js layoutGrid/paintGrid): cards and month headings are placed by hand */
+#libgrid.virtual{position:relative}
+#libgrid.virtual>.clip{position:absolute;contain:layout paint style}
+#libgrid.virtual>.vhead{position:absolute;left:0;right:0}
 .clip{--ease:cubic-bezier(.2,.8,.2,1);position:relative;aspect-ratio:4/3;border-radius:12px;overflow:hidden;background:var(--panel);border:1px solid var(--line);cursor:pointer;outline:none;transition:border-color .2s,box-shadow .2s}
 .clip:hover,.clip:focus-visible{border-color:#3a393e}
 .clip img,.clip video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
@@ -793,7 +797,7 @@ button:focus-visible,.clip:focus-visible{outline:2px solid var(--acc);outline-of
 .qt-box.mini{--qtclips:var(--qtclipsmini)}
 .qt-box>.qt-clips{grid-area:clips}.qt-box>.qt-main{grid-area:main}.qt-box>.qt-side{grid-area:side}.qt-box>.etl{grid-area:tl}
 /* what each level shows */
-.qt-box.trim .etl,.qt-box.trim .qt-tools,.qt-box.trim #qttrim-btn,.qt-box.trim #qtgamepick,.qt-box.trim .qt-assets,
+.qt-box.trim .etl,.qt-box.trim #qttrim-btn,.qt-box.trim #qtgamepick,.qt-box.trim .qt-assets,
 .qt-box.trim #qtfxpropsh,.qt-box.trim #qtfxprops{display:none}
 .qt-box.edit #qttl,.qt-box.edit #qtedit-btn,.qt-box.edit #qtclipstitle,.qt-box.edit .qt-clips:not(.tab-clips) .qt-clipshead{display:none}
 /* Edit: clicking the open tab in the sidebar folds the panel away */
@@ -848,11 +852,6 @@ button:focus-visible,.clip:focus-visible{outline:2px solid var(--acc);outline-of
 #qtsave-btn.dirty::after{content:"";width:6px;height:6px;border-radius:50%;background:#fff;margin-left:2px}
 #qtedit-btn.has::after{content:"";width:6px;height:6px;border-radius:50%;background:var(--acc);margin-left:2px}
 /* Edit: the picture tools under the player */
-.qt-tools{align-self:center;display:flex;align-items:center;gap:2px;margin-top:10px;padding:3px;flex:none;background:var(--as-tile);border:1px solid var(--as-line);border-radius:9px}
-.qt-tool{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 10px;border:0;border-radius:6px;background:transparent;color:#b5b4ba;font:inherit;font-size:12.5px;cursor:pointer;white-space:nowrap}
-.qt-tool .ico{width:16px;height:16px}
-.qt-tool:hover{background:var(--qt-card2);color:#fff}
-.qt-tool.on{background:var(--etl-on);color:#fff}
 /* Edit: the asset panel */
 .qt-box.edit .qt-clipshead{padding:12px 10px 10px}
 .as-title{font-weight:700;color:#fff;font-size:15px;margin:2px 2px 12px}
@@ -878,13 +877,22 @@ button:focus-visible,.clip:focus-visible{outline:2px solid var(--acc);outline-of
 .qt-stage .qt-levels canvas.fx-level{left:0;top:0;width:100%;height:100%}
 .fx-blur{position:absolute}
 .qt-edit{position:absolute;inset:0;cursor:pointer}
-.qt-edit.tool-draw,.qt-edit.tool-crop{cursor:crosshair}
+.qt-edit.tool-draw{cursor:none}
+/* crop: a crop-mark cursor for drawing a new crop (inside the box: move; sides and corners: resize) */
+.qt-edit.tool-crop{cursor:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24'%3E%3Cpath d='M7 2v15h15M2 7h15v15' fill='none' stroke='%23000' stroke-width='3.5'/%3E%3Cpath d='M7 2v15h15M2 7h15v15' fill='none' stroke='%23fff' stroke-width='1.5'/%3E%3C/svg%3E") 7 7,default}
+.fx-brush{position:fixed;z-index:60;pointer-events:none;border-radius:50%;border:1.5px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,.75),inset 0 0 0 1px rgba(0,0,0,.75);transform:translate(-50%,-50%);box-sizing:border-box}
+.fx-brush.erase{border-style:dashed}
 .fx-selbox{position:absolute;border:1.5px solid var(--acc);box-shadow:0 0 0 1px rgba(0,0,0,.55);cursor:move}
 .fx-selbox.zoom{border:1.5px dashed #f0b232}
 .fx-cropbox{position:absolute;border:1.5px solid #fff;box-shadow:0 0 0 9999px rgba(0,0,0,.6);cursor:move}
 .fx-h{position:absolute;width:10px;height:10px;margin:-6px 0 0 -6px;background:#fff;border:1.5px solid var(--acc);border-radius:2px;z-index:2}
 .fx-h.nw{left:0;top:0;cursor:nwse-resize}.fx-h.ne{left:100%;top:0;cursor:nesw-resize}.fx-h.sw{left:0;top:100%;cursor:nesw-resize}.fx-h.se{left:100%;top:100%;cursor:nwse-resize}
 .fx-h.dot{border-radius:50%;cursor:move}
+.fx-edge{position:absolute;z-index:1}
+.fx-edge.n,.fx-edge.s{left:10px;right:10px;height:12px;cursor:ns-resize}.fx-edge.n{top:-6px}.fx-edge.s{bottom:-6px}
+.fx-edge.e,.fx-edge.w{top:10px;bottom:10px;width:12px;cursor:ew-resize}.fx-edge.e{right:-6px}.fx-edge.w{left:-6px}
+.fx-edge::after{content:'';position:absolute;left:50%;top:50%;background:#fff;border-radius:2px;box-shadow:0 0 0 1.5px var(--acc);transform:translate(-50%,-50%)}
+.fx-edge.n::after,.fx-edge.s::after{width:18px;height:4px}.fx-edge.e::after,.fx-edge.w::after{width:4px;height:18px}
 .fx-guide{position:absolute;background:#eb459e;pointer-events:none;z-index:3}
 .fx-guide.v{top:0;bottom:0;width:1px}
 .fx-guide.h{left:0;right:0;height:1px}
@@ -940,6 +948,13 @@ button:focus-visible,.clip:focus-visible{outline:2px solid var(--acc);outline-of
 .trk-b.cb .trk-eg{background:var(--c);width:7px}
 .trk-b.cb .trk-eg:hover,.trk-b.cb.sel .trk-eg{background:#c9c8d0}
 .trk-b.cb.sel{box-shadow:none;border-color:#c9c8d0}
+.trk-b.pc{--c:var(--etl-clipc);background:color-mix(in srgb,var(--c) 10%,transparent);cursor:pointer}
+.trk-b.pc.free{cursor:grab}
+.trk-b.pc .trk-eg{width:5px;opacity:.75}
+.trk-b.pc .trk-eg:hover,.trk-b.pc.sel .trk-eg{opacity:1;background:#c9c8d0}
+.trk-b.pc.sel{box-shadow:none;border-color:#c9c8d0}
+.trk-unl{flex:none;display:flex;color:#f0b232}
+.trk-unl .ico{width:13px;height:13px}
 .trk-b.zb{top:2px;bottom:auto;height:var(--etl-zh);border-radius:3px;z-index:3}
 .trk-b.zb .trk-label{font-size:10px}
 .trk-label{position:absolute;left:9px;top:50%;transform:translateY(-50%);font-size:11px;color:#fff;white-space:nowrap;pointer-events:none;text-shadow:0 1px 2px #000}
@@ -955,7 +970,8 @@ button:focus-visible,.clip:focus-visible{outline:2px solid var(--acc);outline-of
 .trk-ease.out .trk-eg{right:auto;left:-2px}
 .trk-pt{position:absolute;width:9px;height:9px;margin:-4.5px 0 0 -4.5px;border-radius:50%;background:var(--etl-vol);border:1.5px solid #000;cursor:grab;z-index:4}
 .trk-shade{position:absolute;top:0;bottom:0;background:rgba(0,0,0,.66);pointer-events:none;z-index:1}
-.etl-tracks.razor .trk-l,.etl-tracks.razor .trk-b{cursor:crosshair}
+/* the razor: a cut line with a blade, the line is where it cuts (like Premiere's razor cursor) */
+.etl-tracks.razor .trk-l,.etl-tracks.razor .trk-l *{cursor:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24'%3E%3Cpath d='M9 1v22' stroke='%23000' stroke-width='3.5'/%3E%3Cpath d='M9 1v22' stroke='%23fff' stroke-width='1.5'/%3E%3Cpath d='M11 2.5h9.5l-3 7H11z' fill='%23fff' stroke='%23000' stroke-width='1.3' stroke-linejoin='round'/%3E%3C/svg%3E") 9 12,col-resize}
 /* the selected effect's settings */
 .qt-fxprops{display:flex;flex-direction:column;gap:2px}
 .fx-prow{display:flex;align-items:center;gap:8px;margin:3px 0;flex-wrap:wrap}
@@ -1065,3 +1081,13 @@ body.editlevel #libside{align-self:start;height:calc(100% - var(--qttlh,330px))}
 #libside.collapsed .etab .gav{width:44px;height:44px}
 #ctxmenu[data-for="gsort"]{min-width:0}
 #ctxmenu[data-for="gsort"] button{padding-right:16px}
+
+/* zoom steps */
+.trk-zs{position:absolute;top:50%;width:9px;height:9px;margin:-4.5px 0 0 -4.5px;background:#fff;transform:rotate(45deg);border:1.5px solid var(--c);box-sizing:border-box;cursor:ew-resize;z-index:2}
+.trk-zs.on{background:var(--c)}
+.fx-zsteps{display:flex;flex-direction:column;gap:2px;margin:4px 0}
+.fx-zstep{display:flex;align-items:center;gap:8px;padding:1px 4px;border-radius:6px}
+.fx-zstep.on{background:#2b2a30}
+.fx-zgo{background:none;border:0;color:var(--text);font:inherit;font-size:12.5px;cursor:pointer;padding:4px 2px;min-width:52px;text-align:left}
+.fx-zstep .ibtn{margin-left:auto}
+.fx-zsteps .fx-prow{padding-left:8px}

@@ -83,7 +83,7 @@ async function cut({ src, info, start, end, p, out, work, run, headArgs, audio, 
   const parts = [p.head > frame / 2 && path.join(work, 'head.ts'), mid, p.tail > frame / 2 && path.join(work, 'tail.ts')].filter(Boolean);
   if (progress) progress(0.5);
   return run([...quiet, '-progress', 'pipe:1', '-nostats', '-i', 'concat:' + parts.join('|'), ...audio.inputs,
-    '-map', '0:v:0', ...audio.maps, '-c:v', 'copy', ...audio.args, ...extra, '-movflags', '+faststart', out], length);
+    '-map', '0:v:0', ...audio.maps, '-c:v', 'copy', ...audio.args, ...(extra.includes('-movflags') ? extra : [...extra, '-movflags', '+faststart']), out], length);
 }
 
 module.exports = { plan, cut };

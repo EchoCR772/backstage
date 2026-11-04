@@ -40,7 +40,7 @@ const pixel = (f, t, x, y) => { const b = execFileSync(FF, ['-v', 'error', '-ss'
     // text at the playhead on V2, a zoom on V1 (the clip), a second text at the same time: V3
     await w.keyboard.press('t'); await w.waitForTimeout(300);
     await w.keyboard.press('Escape');
-    await w.keyboard.press('z'); await w.waitForTimeout(300);
+    await w.evaluate(() => window.qtFx.useAsset('fx:zoom')); await w.waitForTimeout(300); // (no Z key for now)
     await w.keyboard.press('Escape');
     let f = await fx();
     const txt = f.layers.find(l => l.type === 'text'), zm = f.layers.find(l => l.type === 'zoom');

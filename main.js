@@ -115,7 +115,12 @@ function powershell(cmd) {
 }
 // started a few seconds after launch so the first copy is quick too
 app.whenReady().then(() => setTimeout(() => { if (IS_WIN && !ps) ps = psStart(); }, 4000));
-app.on('will-quit', () => { if (ps) { try { ps.child.stdin.end(); ps.child.kill(); } catch (e) { /* ignore */ } } });
+app.on('will-quit', () => {
+  // renames waiting for the editor to let go of a clip, then the saved edits (written a moment later otherwise)
+  for (const j of [...pendingNames.values()]) { qtFiles.delete(editKey(j.p)); closeFd(j.p); renamePending(j.p); }
+  if (editsTimer) { clearTimeout(editsTimer); try { fs.writeFileSync(editsFile(), JSON.stringify(allEdits())); } catch (e) { /* ignore */ } }
+  if (ps) { try { ps.child.stdin.end(); ps.child.kill(); } catch (e) { /* ignore */ } }
+});
 const psQuote = s => "'" + String(s).replace(/'/g, "''") + "'";
 
 // Put a file on the clipboard the same way Explorer's Ctrl+C does, so Discord can paste it.
@@ -324,7 +329,7 @@ function setEdit(p, e) {
   const all = allEdits();
   if (e) all[editKey(p)] = { ...e, at: Date.now() }; else delete all[editKey(p)];
   clearTimeout(editsTimer);
-  editsTimer = setTimeout(() => { try { fs.writeFileSync(editsFile(), JSON.stringify(all)); } catch (err) { /* ignore */ } }, 300);
+  editsTimer = setTimeout(() => { editsTimer = null; try { fs.writeFileSync(editsFile(), JSON.stringify(all)); } catch (err) { /* ignore */ } }, 300);
 }
 const qtFiles = new Set(); // clips open in the overlay; their bytes can be read by the player
 
@@ -448,13 +453,19 @@ const jsonStore = file => {
   return { all, save };
 };
 const names = jsonStore('names.json'), people = jsonStore('people.json');
+// what a clip was before Backstage renamed its file (type, recorder, date, game: things read from
+// the old name, like NVIDIA's ".DVR"), keyed like names.json
+const kept = jsonStore('kept.json');
 const allPeople = () => people.all();
-const nameKey = (st, meta) => (meta && meta.createdAt ? `d:${meta.createdAt}:${(meta.users || [])[0] || ''}` : `s:${st.size}:${Math.round(st.mtimeMs / 1000)}`);
+// A clip's key for names.json and kept.json: Discord's info, else Encore's encore_id (0.9.36+; follows the
+// clip through renames, moves and Replace original), else its size and date
+const nameKey = (st, meta, tags) => (meta && meta.createdAt ? `d:${meta.createdAt}:${(meta.users || [])[0] || ''}`
+  : tags && tags.encore_id ? `e:${tags.encore_id}` : `s:${st.size}:${Math.round(st.mtimeMs / 1000)}`);
 async function titleOf(p) {
   try {
     const st = fs.statSync(p);
     const { e } = await fileFacts(p, path.basename(p), st);
-    return names.all()[nameKey(st, e.meta)] || null;
+    return names.all()[nameKey(st, e.meta, e.tags)] || null;
   } catch (err) { return null; }
 }
 const cleanTitle = t => String(t || '').replace(/[\x00-\x1f]/g, '').replace(/\s+/g, ' ').trim().slice(0, 120);
@@ -483,7 +494,7 @@ const box01 = b => ({ x: num(b && b.x, 0, 1, 0), y: num(b && b.y, 0, 1, 0), w: n
 const OVERLAYS = ['text', 'image', 'draw', 'shape'];
 function cleanFx(fx) {
   if (!fx || typeof fx !== 'object') return null;
-  const out = { crop: null, layers: [], sounds: [], vpts: {}, fades: {} };
+  const out = { crop: null, layers: [], sounds: [], vpts: {}, fades: {}, cuts: {} };
   if (fx.crop) { const c = box01(fx.crop); if (c.w < 0.999 || c.h < 0.999) out.crop = c; }
   const vtracks = Array.isArray(fx.vtracks) ? fx.vtracks : [], atracks = Array.isArray(fx.atracks) ? fx.atracks : [];
   for (const l of Array.isArray(fx.layers) ? fx.layers : []) {
@@ -491,7 +502,14 @@ function cleanFx(fx) {
     if (l.type !== 'zoom' && vtracks[l.track | 0] && vtracks[l.track | 0].hidden) continue; // zooms are on V1, which can't be hidden
     const L = { type: l.type, track: num(l.track, 0, 99, 0) | 0, start: num(l.start, 0, 1e6), end: num(l.end, 0, 1e6) };
     if (!(L.end > L.start)) continue;
-    if (l.type === 'zoom') Object.assign(L, { box: box01(l.box), ein: num(l.ein, 0, 30, 0), eout: num(l.eout, 0, 30, 0) });
+    if (l.type === 'zoom') {
+      Object.assign(L, { box: box01(l.box), ein: num(l.ein, 0, 30, 0), eout: num(l.eout, 0, 30, 0) });
+      // steps: zoom on from where it is to another box, from time t over `ease`
+      const steps = (Array.isArray(l.steps) ? l.steps : []).filter(st => st && st.box)
+        .map(st => ({ t: num(st.t, 0, 1e6), ease: num(st.ease, 0, 10, 0.4), box: box01(st.box) }))
+        .filter(st => st.t > L.start && st.t < L.end).sort((a, b) => a.t - b.t);
+      if (steps.length) L.steps = steps;
+    }
     else if (l.type === 'blur') Object.assign(L, { box: box01(l.box), strength: num(l.strength, 1, 10, 5) });
     else { if (!l.png || !fs.existsSync(fxFile(l.png))) continue; L.png = fxFile(l.png); }
     out.layers.push(L);
@@ -512,9 +530,17 @@ function cleanFx(fx) {
       out.vpts[k] = pts.map(p => [num(p && p[0], 0, 1e6), num(p && p[1], 0, 2, 1)]).sort((a, b) => a[0] - b[0]);
     }
   }
+  // the clip's own sound rows cut into pieces: each plays from..to (clip time) at `at`
+  if (fx.cuts && typeof fx.cuts === 'object') {
+    for (const [k, c] of Object.entries(fx.cuts)) {
+      if (!c || !Array.isArray(c.pieces) || k.startsWith('s:')) continue;
+      out.cuts[k] = c.pieces.filter(p => p && !p.mute).map(p => ({ from: num(p.from, 0, 1e6), to: num(p.to, 0, 1e6), at: num(p.at, 0, 1e6), vol: num(p.vol, 0, 2, 1) }))
+        .filter(p => p.to > p.from + 0.001 && p.vol > 0.001).sort((a, b) => a.at - b.at);
+    }
+  }
   const f = fx.fades || {};
   for (const k of ['vin', 'vout', 'ain', 'aout']) if (num(f[k], 0, 10, 0) > 0) out.fades[k] = num(f[k], 0, 10, 0);
-  return out.crop || out.layers.length || out.sounds.length || Object.keys(out.vpts).length || Object.keys(out.fades).length ? out : null;
+  return out.crop || out.layers.length || out.sounds.length || Object.keys(out.vpts).length || Object.keys(out.fades).length || Object.keys(out.cuts).length ? out : null;
 }
 const f4 = n => String(Math.round(n * 10000) / 10000);
 // a volume curve through the points (straight lines between them), on the export's own clock
@@ -529,22 +555,32 @@ function curveExpr(pts, off) {
   }
   return `if(lt(t,${f4(p[0][0])}),${f4(p[0][1])},${e})`;
 }
-// zooms: each eases in (smoothstep) over ein, holds, eases out over eout; rect = full frame to box
+// zooms: each eases in (smoothstep) over ein, holds, eases out over eout; rect = full frame to box.
+// A zoom's steps move its box on to another one from time t over `ease` (smoothstep), the same way
+// zoomBoxAt does in the editor: b = b*(1-u) + step*u, one step after another.
 function zoomExpr(zooms, off) {
+  const ss = (v, a, d) => (d > 0.001 ? `(clip((it-(${f4(v)}))/${f4(d)},0,1))` : `gte(it,${f4(v)})`);
   const terms = zooms.map(z => {
     const S = Math.max(0, z.start - off), E = z.end - off, half = (E - S) / 2;
     const a = Math.min(z.ein, half), b = Math.min(z.eout, half);
     const rin = a > 0.001 ? `clip((it-(${f4(S)}))/${f4(a)},0,1)` : `gte(it,${f4(S)})`;
     const rout = b > 0.001 ? `clip((${f4(E)}-it)/${f4(b)},0,1)` : `lt(it,${f4(E)})`;
     const u = `min(${rin},${rout})`;
-    return { e: `(${u})*(${u})*(3-2*(${u}))`, z };
+    // the box, as expressions of time when there are steps
+    const bx = { x: f4(z.box.x), y: f4(z.box.y), w: f4(z.box.w) };
+    for (const st of z.steps || []) {
+      const v = ss(st.t - off, 0, st.ease), us = st.ease > 0.001 ? `(${v}*${v}*(3-2*${v}))` : v;
+      for (const k of ['x', 'y', 'w']) bx[k] = `((${bx[k]})*(1-${us})+${f4(st.box[k])}*${us})`;
+    }
+    return { e: `(${u})*(${u})*(3-2*(${u}))`, bx };
   });
-  const sum = g => terms.map(t => `${f4(g(t.z))}*${t.e}`).join('+');
-  return { z: `1/(1-(${sum(z => 1 - z.box.w)}))`, x: `(${sum(z => z.box.x)})*iw`, y: `(${sum(z => z.box.y)})*ih` };
+  const sum = g => terms.map(t => `(${g(t.bx)})*${t.e}`).join('+');
+  return { z: `1/(1-(${sum(b => `1-${b.w}`)}))`, x: `(${sum(b => b.x)})*iw`, y: `(${sum(b => b.y)})*ih` };
 }
 const even = n => Math.max(2, Math.floor(n / 2) * 2);
-async function fxMake({ src, info, start, length, list, fx, target, out, progress, job, audioOnly }) {
-  fx = fx || { crop: null, layers: [], sounds: [], vpts: {}, fades: {} };
+async function fxMake({ src, info, start, length, list, fx, target, out, progress, job, audioOnly, mark = ['-movflags', '+faststart'] }) {
+  fx = fx || { crop: null, layers: [], sounds: [], vpts: {}, fades: {}, cuts: {} };
+  const cuts = fx.cuts || {};
   const end = start + length, W = info.width || 1920, H = info.height || 1080, fps = info.fps || 30;
   let cw = even(W), ch = even(H), cx = 0, cy = 0;
   if (fx.crop) {
@@ -603,8 +639,18 @@ async function fxMake({ src, info, start, length, list, fx, target, out, progres
   list.forEach((s, i) => {
     const c = curveExpr(fx.vpts[s.key], start);
     const vol = c ? `volume='${f4(s.gain)}*(${c})':eval=frame` : `volume=${f4(s.gain)}`;
-    parts.push(`[0:a:${s.index}]aresample=48000,${info.audio[s.index] && info.audio[s.index].channels === 'mono' ? 'pan=stereo|c0=c0|c1=c0,' : ''}aformat=sample_fmts=fltp:channel_layouts=stereo,${vol}[a${i}]`);
-    labels.push(`[a${i}]`);
+    const fmtA = `aresample=48000,${info.audio[s.index] && info.audio[s.index].channels === 'mono' ? 'pan=stereo|c0=c0|c1=c0,' : ''}aformat=sample_fmts=fltp:channel_layouts=stereo`;
+    const pieces = cuts[s.key];
+    if (!pieces) { parts.push(`[0:a:${s.index}]${fmtA},${vol}[a${i}]`); labels.push(`[a${i}]`); return; }
+    // a cut row: each piece read on its own from the clip and put where it sits on the timeline
+    pieces.forEach((p, j) => {
+      const from = Math.max(start, p.at), to = Math.min(end, p.at + (p.to - p.from));
+      if (to <= from + 0.01) return;
+      inputs.push('-ss', (p.from + from - p.at).toFixed(3), '-t', (to - from).toFixed(3), '-i', src);
+      const pv = Math.abs(p.vol - 1) > 0.001 ? `,volume=${f4(p.vol)}` : '';
+      parts.push(`[${nIn++}:a:${s.index}]${fmtA},adelay=${Math.round((from - start) * 1000)}:all=1,${vol}${pv}[a${i}p${j}]`);
+      labels.push(`[a${i}p${j}]`);
+    });
   });
   fx.sounds.forEach((s, i) => {
     const from = Math.max(start, s.at), to = Math.min(end, s.at + (s.to - s.from));
@@ -621,7 +667,8 @@ async function fxMake({ src, info, start, length, list, fx, target, out, progres
     if (fx.fades.ain) af.push(`afade=t=in:st=0:d=${f4(Math.min(fx.fades.ain, length / 2))}`);
     if (fx.fades.aout) af.push(`afade=t=out:st=${f4(Math.max(0, length - fx.fades.aout))}:d=${f4(Math.min(fx.fades.aout, length / 2))}`);
     const mix = labels.length > 1 ? `amix=inputs=${labels.length}:duration=longest:normalize=0` : 'anull';
-    parts.push(`${labels.join('')}${[mix, ...af].join(',')}[aout]`);
+    // silence to the end (a cut or a late sound can end before the trim does); -t stops it there
+    parts.push(`${labels.join('')}${[mix, 'apad', ...af].join(',')}[aout]`);
     alabel = '[aout]';
   }
   if (audioOnly && !alabel) throw new Error('All the audio is muted, so there is nothing to export.');
@@ -639,7 +686,7 @@ async function fxMake({ src, info, start, length, list, fx, target, out, progres
     if (alabel) a.push('-map', alabel, ...(audioOnly ? ['-c:a', 'libmp3lame', '-b:a', '192k'] : ['-c:a', 'aac', '-b:a', '160k']));
     else a.push('-an');
     a.push('-t', length.toFixed(3));
-    if (!audioOnly) a.push('-movflags', '+faststart');
+    if (!audioOnly) a.push(...mark);
     a.push(out);
     return a;
   };
@@ -658,8 +705,27 @@ async function fxMake({ src, info, start, length, list, fx, target, out, progres
   return r;
 }
 
-async function makeFile({ src, info, start, length, audioOnly, list, out, progress, job, keepTracks, fx, target }) {
-  if (!keepTracks && (fx || target)) return fxMake({ src, info, start, length, list, fx, target, out, progress, job, audioOnly });
+// Backstage's marker on every video it makes: what the original was (type, recorder, game, date), so the
+// new file shows under Edited and in the right place whatever it's called later. Written as named MP4
+// tags (use_metadata_tags), read back by readMp4Tags.
+async function markFor(src, what) {
+  const args = ['-movflags', '+faststart+use_metadata_tags'];
+  try {
+    const st = fs.statSync(src), { e } = await fileFacts(src, path.basename(src), st);
+    const lib = (await libFolders()).find(f => !f.missing && inside(f.path, src));
+    const parts = lib ? path.relative(lib.path, src).split(path.sep) : [];
+    const f = clipFacts(path.basename(src), st, e, parts.length > 1 ? parts[0] : null, lib && lib.kind);
+    const tags = {
+      backstage: f.kind === 'export' ? 'export' : what, backstage_kind: f.type || '', backstage_origin: f.origin || '',
+      backstage_game: f.rawGame && f.rawGame !== 'Other' ? f.rawGame : '', backstage_date: String(Math.round(f.date)),
+    };
+    for (const [k, v] of Object.entries(tags)) if (v) args.push('-metadata', `${k}=${v}`);
+  } catch (err) { args.push('-metadata', `backstage=${what}`); }
+  return args;
+}
+async function makeFile({ src, info, start, length, audioOnly, list, out, progress, job, keepTracks, fx, target, mark }) {
+  mark = audioOnly ? [] : mark || ['-movflags', '+faststart'];
+  if (!keepTracks && (fx || target)) return fxMake({ src, info, start, length, list, fx, target, out, progress, job, audioOnly, mark });
   if (audioOnly) return runFfmpeg(audioArgs({ src, info, start, length, list, audioOnly, out }), length, progress, job);
   const end = start + length;
   const enc = await pickEncoder();
@@ -672,7 +738,7 @@ async function makeFile({ src, info, start, length, audioOnly, list, out, progre
       ? { inputs: ['-ss', start.toFixed(6), '-t', length.toFixed(6), '-i', src], maps: ['-map', '1:a?'], args: ['-c:a', 'copy', '-map_metadata', '1'] }
       : muxAudio({ src, info, start, length, list });
     try {
-      const r = await smartcut.cut({ src, info, start, end, p, out, work, run, headArgs: enc.args(sourceKbps(info)), audio: a, progress: x => progress && progress(x), avIn: av1In(info.codec) });
+      const r = await smartcut.cut({ src, info, start, end, p, out, work, run, headArgs: enc.args(sourceKbps(info)), audio: a, progress: x => progress && progress(x), avIn: av1In(info.codec), extra: mark });
       if (r.cancelled || job.cancelled) return { ok: false, cancelled: true, err: [] };
       if (r.ok && await looksRight(out, length, p.head)) return { ...r, smart: true };
     } finally { fs.rm(work, { recursive: true, force: true }, () => {}); }
@@ -683,7 +749,7 @@ async function makeFile({ src, info, start, length, audioOnly, list, out, progre
       '-ss', start.toFixed(3), '-t', length.toFixed(3), '-i', src, '-map', '0:v:0', ...videoArgs];
     if (keepTracks) a.push('-map', '0:a?', '-c:a', 'copy', '-map_metadata', '0');
     else a.push(...audioArgs({ src, info, start, length, list, inline: true }));
-    a.push('-movflags', '+faststart', out);
+    a.push(...mark, out);
     return a;
   };
   let r = await runFfmpeg(build(enc.args(sourceKbps(info))), length, progress, job);
@@ -763,7 +829,7 @@ async function savedJob(src, o = {}) {
   const groups = audioGroups(info);
   let sources;
   // volume points on the clip's own rows: every row is mixed on its own so each can follow its curve
-  if (fx && Object.keys(fx.vpts).some(k => !k.startsWith('s:'))) {
+  if (fx && (Object.keys(fx.vpts).some(k => !k.startsWith('s:')) || Object.keys(fx.cuts).length)) {
     sources = groups.map(g => ({ ...g, ...savedFor(g, audio) })).filter(g => !g.mute && g.vol > 0.001)
       .flatMap(g => g.idx.map(i => ({ index: i, gain: g.vol, key: g.key })));
   } else sources = sourcesFor(info, audio).map(x => ({ ...x, key: (groups.find(g => g.idx.includes(x.index)) || {}).key || '' }));
@@ -781,7 +847,7 @@ function prepare(src, j) {
   const dir = tempDir('prep'), out = path.join(dir, outName(src, j.title) + '.mp4');
   const job = { child: null, kids: new Set(), cancelled: false };
   e = { out, job, at: Date.now() };
-  e.ready = makeFile({ src, info: j.info, start: j.start, length: j.end - j.start, audioOnly: false, list: j.sources, out, progress: null, job, fx: j.fx })
+  e.ready = markFor(src, 'export').then(mark => makeFile({ src, info: j.info, start: j.start, length: j.end - j.start, audioOnly: false, list: j.sources, out, progress: null, job, fx: j.fx, mark }))
     .then(r => { if (!r.ok) { prepared.delete(key); fs.rmSync(dir, { recursive: true, force: true }); } return { ...r, out }; });
   prepared.set(key, e);
   trimPrepared();
@@ -850,18 +916,18 @@ async function qtExport(o) {
   if (dest === 'clipboard' || dest === 'temp') out = path.join(tempDir('copy'), outName(src, title) + ext);
   else if (dest === 'saveas') {
     const r = await dialog.showSaveDialog(win, {
-      title: audioOnly ? 'Export audio as' : 'Export trimmed clip as',
-      defaultPath: freeName(await exportFolder(src), outName(src, title), ext),
+      title: audioOnly ? 'Export audio as' : 'Export clip as',
+      defaultPath: freeName(exportFolder(src), outName(src, title), ext),
       filters: audioOnly ? [{ name: 'MP3 audio', extensions: ['mp3'] }] : [{ name: 'MP4 video', extensions: ['mp4'] }],
     });
     if (r.canceled || !r.filePath) return { cancelled: true };
     out = path.extname(r.filePath) ? r.filePath : r.filePath + ext;
     if (samePath(out, src)) throw new Error('To overwrite the original, use Replace original in the Export menu.');
-  } else out = freeName(await exportFolder(src), outName(src, title), ext);
+  } else out = freeName(exportFolder(src), outName(src, title), ext);
 
   const progress = p => win && !win.isDestroyed() && win.webContents.send('qt-progress', p);
   state.cancelled = false;
-  const r = await makeFile({ src, info, start, length, audioOnly, list, out, progress, job: state, fx, target });
+  const r = await makeFile({ src, info, start, length, audioOnly, list, out, progress, job: state, fx, target, mark: await markFor(src, 'export') });
   if (r.cancelled) { fs.rmSync(out, { force: true }); return { cancelled: true }; }
   if (!r.ok) { fs.rmSync(out, { force: true }); throw new Error('Export failed: ' + r.err.join(' | ')); }
   state.outputs.add(out);
@@ -881,12 +947,12 @@ async function qtReplace(o) {
   if (start <= 0.01 && end >= info.duration - 0.01) throw new Error("It isn't trimmed, so there's nothing to replace.");
   const st = fs.statSync(src);
   const { e: facts } = await fileFacts(src, path.basename(src), st);
-  const oldKey = nameKey(st, facts.meta);
+  const oldKey = nameKey(st, facts.meta, facts.tags);
   const box = await readDiscordBox(src, st.size);
   const tmp = path.join(path.dirname(src), '.' + path.basename(src, path.extname(src)) + '.replacing.mp4');
   const progress = p => win && !win.isDestroyed() && win.webContents.send('qt-progress', p);
   state.cancelled = false;
-  const r = await makeFile({ src, info, start, length: end - start, audioOnly: false, list: [], out: tmp, progress, job: state, keepTracks: true });
+  const r = await makeFile({ src, info, start, length: end - start, audioOnly: false, list: [], out: tmp, progress, job: state, keepTracks: true, mark: await markFor(src, 'replaced') });
   if (!r.ok) { fs.rmSync(tmp, { force: true }); if (r.cancelled) return { cancelled: true }; throw new Error('Replacing failed: ' + r.err.join(' | ')); }
   try {
     // Discord's clip info goes back on the end, with the new length
@@ -900,11 +966,71 @@ async function qtReplace(o) {
   if (IS_WIN) await powershell(`(Get-Item -LiteralPath ${psQuote(src)}).CreationTimeUtc = [DateTimeOffset]::FromUnixTimeMilliseconds(${Math.round(st.birthtimeMs)}).UtcDateTime`);
   // its name moves with it (the size changed), the trim is reset, the audio settings stay
   const nst = fs.statSync(src);
-  const all = names.all(), newKey = nameKey(nst, facts.meta);
+  const all = names.all(), newKey = nameKey(nst, facts.meta, facts.tags);
   if (all[oldKey] && newKey !== oldKey) { all[newKey] = all[oldKey]; delete all[oldKey]; names.save(); }
+  const ka = kept.all();
+  if (ka[oldKey] && newKey !== oldKey) { ka[newKey] = ka[oldKey]; delete ka[oldKey]; kept.save(); }
   const ed = editFor(src), newDur = (await ffInfo(src)).duration || end - start;
   setEdit(src, ed && ed.audio && Object.keys(ed.audio).length ? { in: 0, out: newDur, dur: newDur, audio: ed.audio } : null);
-  return { size: nst.size, duration: newDur, smart: !!r.smart };
+  // Settings > File names: the file takes the clip's name too
+  let to = src;
+  if (renameFiles() && all[newKey]) { try { to = await renameFile(src, all[newKey]); } catch (e) { /* keeps its name */ } }
+  return { size: nst.size, duration: newDur, smart: !!r.smart, path: to, name: path.basename(to), url: pathToFileURL(to).href };
+}
+
+// ---------- the file takes the clip's name (Settings > File names, off by default) ----------
+// What the old name told Backstage (NVIDIA's ".DVR", the date in NVIDIA's and Encore's names, the game in
+// Discord's) is kept first (kept.json), and the saved edit and thumbnail follow the file. A clip open in
+// the editor is renamed once the editor lets go of it (switching clips, closing it, quitting).
+const renameFiles = () => readSettings().renameFiles === true;
+const pendingNames = new Map(); // editKey(path) -> { p, title }
+async function keepFacts(p) {
+  const st = fs.statSync(p), { e } = await fileFacts(p, path.basename(p), st);
+  const lib = (await libFolders()).find(f => !f.missing && inside(f.path, p));
+  const parts = lib ? path.relative(lib.path, p).split(path.sep) : [];
+  const f = clipFacts(path.basename(p), st, e, parts.length > 1 ? parts[0] : null, lib && lib.kind);
+  const all = kept.all(), key = nameKey(st, e.meta, e.tags);
+  all[key] = { kind: f.kind, type: f.type, origin: f.origin, date: Math.round(f.date), ...(f.fromName ? { game: f.rawGame } : {}) };
+  kept.save();
+}
+function targetName(p, title) {
+  const t = safeName(title).replace(/\.(mp4|mkv|mov|webm|m4v)$/i, '');
+  const ext = path.extname(p), dir = path.dirname(p);
+  if (!cleanTitle(title) || path.basename(p, ext) === t) return null;
+  const to = path.join(dir, t + ext);
+  return fs.existsSync(to) && !samePath(to, p) ? freeName(dir, t, ext) : to;
+}
+function moveNow(p, to) {
+  closeFd(p);
+  dropPrepared(p);
+  fs.renameSync(p, to);
+  const all = allEdits(), ek = editKey(p);
+  if (all[ek]) { setEdit(to, all[ek]); setEdit(p, null); }
+  // the thumbnail too (same size and date, new path)
+  try {
+    const st = fs.statSync(to), idx = loadIndex(), a = thumbKey(p, st), b = thumbKey(to, st);
+    if (idx[a]) { idx[b] = idx[a]; delete idx[a]; saveIndexSoon(); }
+    const jpg = path.join(thumbDir(), a + '.jpg');
+    if (fs.existsSync(jpg)) fs.renameSync(jpg, path.join(thumbDir(), b + '.jpg'));
+  } catch (e) { /* made again */ }
+  if (opened.has(ek)) { opened.delete(ek); opened.add(editKey(to)); }
+  return to;
+}
+async function renameFile(p, title) {
+  if (!targetName(p, title)) return p;
+  await keepFacts(p);
+  const to = targetName(p, title);
+  return to ? moveNow(p, to) : p;
+}
+// the editor let go of a clip: a rename waiting for it happens now
+function renamePending(p) {
+  const k = editKey(p), j = pendingNames.get(k);
+  if (!j || qtFiles.has(k)) return;
+  pendingNames.delete(k);
+  try {
+    const to = targetName(j.p, j.title);
+    if (to && fs.existsSync(j.p)) { moveNow(j.p, to); if (win && !win.isDestroyed()) win.webContents.send('clip-moved', { from: j.p, to, name: path.basename(to), url: pathToFileURL(to).href }); }
+  } catch (e) { log('rename failed: ' + e.message); }
 }
 // Discord's "uuid" box at the end of the clip: its bytes and where the JSON sits in it
 async function readDiscordBox(p, size) {
@@ -1011,40 +1137,23 @@ function discordFolder() {
   return discordRoot;
 }
 
-// ---------- where trimmed clips go ----------
-// Their own folder, one subfolder per game, so the NVIDIA/Discord folders stay just recordings.
-// Default: next to NVIDIA's folder (same drive), else in Videos, named after the app. Changeable in Settings.
-async function exportDir() {
+// ---------- where exports go ----------
+// Next to the clip they come from (Nov 4, 2026; his call), so a clip and its edited copy sit together
+// wherever you browse. Tests send them to their own folder (BACKSTAGE_EXPORTS) so fixtures stay clean.
+// Before 1.49.0 they went into one folder of their own (next to NVIDIA's folder, named after the app,
+// one subfolder per game): that folder stays in the library while it exists, as "Old exports".
+async function oldExportsDir() {
   if (process.env.BACKSTAGE_EXPORTS) return process.env.BACKSTAGE_EXPORTS;
   const s = readSettings();
   if (s.exportDir) return s.exportDir;
   const nv = await nvidiaFolder(), base = nv ? path.dirname(nv) : app.getPath('videos');
-  // after a rename, keep using the folder that already has trims in it
-  for (const n of OLD_NAMES) if (!isDir(path.join(base, APP_NAME)) && isDir(path.join(base, safeName(n)))) return path.join(base, safeName(n));
-  return path.join(base, safeName(APP_NAME));
+  for (const n of [APP_NAME, ...OLD_NAMES]) if (isDir(path.join(base, safeName(n)))) return path.join(base, safeName(n));
+  return null;
 }
 const safeName = n => String(n || '').replace(/[<>:"/\\|?*\x00-\x1f]/g, '').replace(/\s+/g, ' ').replace(/[. ]+$/, '').trim().slice(0, 80) || 'Other';
-// which game a clip belongs to, as a folder name for its trims
-async function gameFolderFor(src) {
-  for (const f of await libFolders()) {
-    if (f.kind === 'trimmed') continue;
-    const rel = path.relative(f.path, src);
-    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) continue;
-    const parts = rel.split(path.sep);
-    if (parts.length > 1) return parts[0];
-    break;
-  }
-  try {
-    const meta = await readDiscordMeta(src, fs.statSync(src).size);
-    if (meta && meta.applicationName) return isDesktopName(fixText(meta.applicationName)) ? 'Desktop' : safeName(cleanGame(meta.applicationName));
-  } catch (e) { /* not Discord's */ }
-  const nv = path.basename(src).match(/^(.*?) \d{4}\.\d{2}\.\d{2} - /), dn = path.basename(src).match(DISCORD_NAME);
-  if (nv) return safeName(nv[1]);
-  if (dn) return safeName(dn[1].replace(/_/g, ' '));
-  return 'Other';
-}
-async function exportFolder(src) {
-  const dir = path.join(await exportDir(), await gameFolderFor(src));
+const hasFiles = d => { try { return !!d && fs.readdirSync(d).length > 0; } catch (e) { return false; } };
+function exportFolder(src) {
+  const dir = process.env.BACKSTAGE_EXPORTS || path.dirname(src);
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 }
@@ -1052,11 +1161,11 @@ async function exportFolder(src) {
 async function libFolders() {
   if (process.env.BACKSTAGE_LIBRARY) {
     const l = process.env.BACKSTAGE_LIBRARY.split(path.delimiter).map(p => ({ path: p, kind: 'folder' }));
-    const ex = await exportDir();
-    if (process.env.BACKSTAGE_EXPORTS && isDir(ex)) l.push({ path: ex, kind: 'trimmed' });
+    const ex = process.env.BACKSTAGE_EXPORTS;
+    if (hasFiles(ex)) l.push({ path: ex, kind: 'trimmed' });
     return l;
   }
-  const nv = await nvidiaFolder(), dc = discordFolder(), enc = encoreFolder(), ex = await exportDir();
+  const nv = await nvidiaFolder(), dc = discordFolder(), enc = encoreFolder(), ex = await oldExportsDir();
   const kindOf = p => (nv && samePath(p, nv) ? 'nvidia' : dc && samePath(p, dc) ? 'discord' : enc && samePath(p, enc) ? 'encore' : 'folder');
   const s = readSettings();
   // a saved folder list has never seen Encore: add it once (taking it out later sticks)
@@ -1065,10 +1174,10 @@ async function libFolders() {
     s.encoreSeen = enc;
     writeSettings(s);
   }
-  const list = (Array.isArray(s.folders) ? s.folders : [nv, dc, enc].filter(Boolean)).filter(p => typeof p === 'string' && !samePath(p, ex));
+  const list = (Array.isArray(s.folders) ? s.folders : [nv, dc, enc].filter(Boolean)).filter(p => typeof p === 'string' && !(ex && samePath(p, ex)));
   const out = list.map(p => ({ path: p, kind: kindOf(p), missing: !isDir(p) }));
-  // the trimmed-clips folder is always part of the library once something has been exported
-  if (isDir(ex)) out.push({ path: ex, kind: 'trimmed' });
+  // the old exports folder stays in the library while it's there (Remove takes it out for good)
+  if (hasFiles(ex) && !s.oldExportsOff) out.push({ path: ex, kind: 'trimmed' });
   return out;
 }
 async function detectedFolders() {
@@ -1119,12 +1228,28 @@ const looksLikeTab = n => /^\(\d+\)\s/.test(n) || SITES.test(n) || /\s-\s*$/.tes
 // NVIDIA names folders after the game with ":" dropped ("Call of Duty  Black Ops 6") or after
 // the exe when it doesn't know the game ("peak.exe")
 const gameName = folder => folder.replace(/\.exe$/i, '').replace(/\s{2,}/g, ': ').trim() || 'Other';
-function clipKind(name, meta) {
-  if (/_trim\d*\.\w+$/i.test(name)) return 'trim';
+// What a clip is. kind = its badge: discord | replay (NVIDIA Instant Replay) | echo (Encore's replay) |
+// recording | export (made by Backstage) | other. type = the top filter: clip | recording | null.
+// Every recorder marks its files its own way (Discord's info box, NVIDIA's names, Encore's tags);
+// a new recorder gets its own line here. Old exports are named "..._trim"; new ones carry Backstage's tags.
+const typeOfKind = k => (k === 'discord' || k === 'replay' || k === 'echo' ? 'clip' : k === 'recording' ? 'recording' : null);
+function clipKind(name, meta, tags, source) {
+  const base = name.replace(/_trim\d*(?=\.\w+$)/i, '');
   if (meta || DISCORD_NAME.test(name)) return 'discord';
-  if (/\.DVR\.\w+$/i.test(name)) return 'replay';
-  if (NV_DATE.test(name)) return 'recording';
+  if (/\.DVR\.\w+$/i.test(base)) return 'replay';
+  if (source === 'encore' || (tags && tags.encore) || looksEncore(base)) return tags && tags.encore_kind === 'replay' ? 'echo' : 'recording';
+  if (NV_DATE.test(base)) return 'recording';
   return 'other';
+}
+function classify(name, meta, tags, k, source) {
+  tags = tags || {};
+  const exported = tags.backstage === 'export' || source === 'trimmed' || /_trim\d*\.\w+$/i.test(name);
+  const was = k && k.kind ? k.kind : clipKind(name, meta, tags, source);
+  const kind = exported ? 'export' : was;
+  // Backstage's marker (exports, replaced originals) says what the original was, wherever the file goes
+  const marked = tags.backstage && (tags.backstage_kind === 'clip' || tags.backstage_kind === 'recording') ? tags.backstage_kind : null;
+  const type = marked || (k && k.type) || typeOfKind(was);
+  return { kind, type, edited: kind === 'export' || tags.backstage === 'replaced' };
 }
 
 // Discord, NVIDIA or Encore - also for trims, whose names keep the original's
@@ -1161,6 +1286,76 @@ async function readDiscordMeta(p, size) {
     }
   } catch (e) { /* unreadable */ } finally { try { await fh.close(); } catch (e) { /* ignore */ } }
   return null;
+}
+
+// Tags inside an MP4 (moov > udta > meta): the plain ones ffmpeg writes (©cmt "comment" etc.) and
+// named ones (keys box, written with -movflags use_metadata_tags): Encore's encore_kind / encore_game,
+// Backstage's own backstage_* marker. Small reads only: the box headers, then udta itself.
+// Each recorder marks its files its own way; new ones get their tags read here.
+async function readMp4Tags(p, size) {
+  let fh;
+  try { fh = await fs.promises.open(p, 'r'); } catch (e) { return null; }
+  const head = Buffer.alloc(16);
+  const box = async (pos, end) => {
+    if (pos + 8 > end || (await fh.read(head, 0, 16, pos)).bytesRead < 8) return null;
+    let len = head.readUInt32BE(0), hdr = 8;
+    if (len === 1) { len = Number(head.readBigUInt64BE(8)); hdr = 16; } else if (len === 0) len = end - pos;
+    if (len < hdr || pos + len > end) return null;
+    return { type: head.toString('latin1', 4, 8), pos, len, hdr };
+  };
+  const tags = {};
+  const parseMeta = b => {
+    // a full box (version/flags) in MP4 files, a plain one in some QuickTime files
+    let off = b.toString('latin1', 4, 8) === 'hdlr' ? 0 : 4;
+    const keys = [];
+    let ilst = null;
+    while (off + 8 <= b.length) {
+      const len = b.readUInt32BE(off), type = b.toString('latin1', off + 4, off + 8);
+      if (len < 8 || off + len > b.length) break;
+      if (type === 'keys') {
+        const n = b.readUInt32BE(off + 12);
+        let k = off + 16;
+        for (let i = 0; i < n && k + 8 <= off + len; i++) { const kl = b.readUInt32BE(k); if (kl < 8) break; keys.push(b.toString('utf8', k + 8, k + kl)); k += kl; }
+      } else if (type === 'ilst') ilst = [off + 8, off + len];
+      off += len;
+    }
+    if (!ilst) return;
+    for (let i = ilst[0]; i + 8 <= ilst[1];) {
+      const len = b.readUInt32BE(i);
+      if (len < 8 || i + len > ilst[1]) break;
+      const idx = b.readUInt32BE(i + 4), four = b.toString('latin1', i + 4, i + 8);
+      const name = idx >= 1 && idx <= keys.length ? keys[idx - 1] : four === '©cmt' ? 'comment' : null;
+      // the value: a 'data' box (type, locale, then the text)
+      if (name && len >= 24 && b.toString('latin1', i + 12, i + 16) === 'data') {
+        const dl = b.readUInt32BE(i + 8);
+        tags[name.toLowerCase()] = b.toString('utf8', i + 24, i + 8 + Math.min(dl, len - 8)).replace(/\0+$/, '');
+      }
+      i += len;
+    }
+  };
+  try {
+    let moov = null;
+    for (let pos = 0, n = 0; n < 64; n++) { const b = await box(pos, size); if (!b) break; if (b.type === 'moov') { moov = b; break; } pos += b.len; }
+    if (!moov) return tags;
+    const end = moov.pos + moov.len;
+    const read = async b => { const buf = Buffer.alloc(b.len - b.hdr); await fh.read(buf, 0, buf.length, b.pos + b.hdr); return buf; };
+    for (let pos = moov.pos + moov.hdr, n = 0; n < 256; n++) {
+      const b = await box(pos, end);
+      if (!b) break;
+      if (b.type === 'meta' && b.len < (1 << 20)) parseMeta(await read(b));
+      if (b.type === 'udta' && b.len < (1 << 20)) {
+        const u = await read(b);
+        for (let i = 0; i + 8 <= u.length;) {
+          const len = u.readUInt32BE(i);
+          if (len < 8 || i + len > u.length) break;
+          if (u.toString('latin1', i + 4, i + 8) === 'meta') parseMeta(u.subarray(i + 8, i + len));
+          i += len;
+        }
+      }
+      pos += b.len;
+    }
+  } catch (e) { /* unreadable: whatever was found */ } finally { try { await fh.close(); } catch (e) { /* ignore */ } }
+  return tags;
 }
 
 const thumbDir = () => path.join(app.getPath('userData'), 'thumbs');
@@ -1207,8 +1402,40 @@ async function fileFacts(full, name, st) {
     idx[key] = e;
     saveIndexSoon();
   }
+  // the file's own tags (recorder and Backstage markers); older index entries get them once
+  if (e.tagsV !== 2) { // 2: Encore 0.9.36's tags
+    e.tagsV = 2;
+    const t = /\.(mp4|m4v|mov)$/i.test(name) ? await readMp4Tags(full, st.size) : null;
+    e.tags = {};
+    // Encore's (its file contract: one-line values up to 200 characters, unknown tags ignored) and Backstage's own
+    for (const k of ['encore_kind', 'encore_game', 'encore_id', 'backstage', 'backstage_kind', 'backstage_origin', 'backstage_game', 'backstage_date']) if (t && t[k]) e.tags[k] = String(t[k]).slice(0, 200);
+    if (t && Object.keys(t).some(k => k.startsWith('encore_'))) e.tags.encore = '1'; // any encore_ tag: Encore made it (a recovered file has only encore_id)
+    saveIndexSoon();
+  }
   return { key, e };
 }
+
+// a clip's date, game, kind and recorder, from (in order) Discord's info, Backstage's and the recorder's
+// tags inside the file, what was kept when Backstage renamed it, the folder, the file name
+function clipFacts(name, st, e, folder, source) {
+  const meta = e.meta || null, tags = e.tags || {}, k = kept.all()[nameKey(st, meta, tags)] || null;
+  const base = name.replace(/_trim\d*(?=\.\w+$)/i, '');
+  const nv = base.match(NV_DATE), dn = name.match(DISCORD_NAME);
+  const own = Number(tags.backstage_date) || 0;
+  const date = meta && meta.createdAt ? meta.createdAt : own || (k && k.date)
+    || (nv ? new Date(+nv[1], +nv[2] - 1, +nv[3], +nv[4], +nv[5], +nv[6]).getTime() : st.mtimeMs);
+  const named = tags.backstage_game || tags.encore_game || (k && k.game) || '';
+  let game = meta && meta.app ? cleanGame(meta.app)
+    : named ? cleanGame(named)
+    : folder !== null && folder !== undefined ? gameName(folder)
+    : dn ? dn[1].replace(/_/g, ' ').trim() : 'Other';
+  const rawGame = game;
+  if (game !== 'Other' && isDesktopName(game)) game = 'Desktop';
+  const c = classify(name, meta, tags, k, source);
+  const origin = tags.backstage_origin && SOURCES.has(tags.backstage_origin) ? tags.backstage_origin : (k && k.origin) || (tags.encore ? 'encore' : clipOrigin(base, meta, source));
+  return { date, game, rawGame, fromName: !(meta && meta.app) && !named && (folder === null || folder === undefined) && !!dn, ...c, origin };
+}
+const SOURCES = new Set(['discord', 'nvidia', 'encore']);
 
 async function scanFolder(root, kind, out, progress) {
   const walk = async (dir, folder, sub, depth) => {
@@ -1227,20 +1454,12 @@ async function scanFolder(root, kind, out, progress) {
       const { e } = await fileFacts(full, d.name, st);
       progress();
       const meta = e.meta || null;
-      const nv = d.name.match(NV_DATE), dn = d.name.match(DISCORD_NAME);
-      const date = meta && meta.createdAt ? meta.createdAt
-        : nv ? new Date(+nv[1], +nv[2] - 1, +nv[3], +nv[4], +nv[5], +nv[6]).getTime() : st.mtimeMs;
-      // which game: Discord's info, else the folder it's in, else the Discord-style name
-      let game = meta && meta.app ? cleanGame(meta.app)
-        : folder !== null ? gameName(folder)
-        : dn ? dn[1].replace(/_/g, ' ').trim() : 'Other';
-      const rawGame = game;
-      if (game !== 'Other' && isDesktopName(game)) game = 'Desktop';
+      const f = clipFacts(d.name, st, e, folder, kind);
       out.push({
-        path: full, root, url: pathToFileURL(full).href, name: d.name, sub, date, size: st.size, mtime: Math.round(st.mtimeMs),
-        source: kind, kind: kind === 'trimmed' ? 'trim' : clipKind(d.name, meta), origin: clipOrigin(d.name, meta, kind), gameName: game, rawGame, fromName: !(meta && meta.app) && folder === null && !!dn,
+        path: full, root, url: pathToFileURL(full).href, name: d.name, sub, date: f.date, size: st.size, mtime: Math.round(st.mtimeMs),
+        source: kind, kind: f.kind, type: f.type, edited: f.edited, origin: f.origin, gameName: f.game, rawGame: f.rawGame, fromName: f.fromName,
         duration: e.error ? null : (e.duration || null), users: meta ? meta.users : [], edit: editFor(full),
-        title: names.all()[nameKey(st, meta)] || null,
+        title: names.all()[nameKey(st, meta, e.tags)] || null,
       });
     }
   };
@@ -1499,7 +1718,7 @@ ipcMain.handle('qt-open', wrap(async (_e, p) => {
   qtFiles.add(editKey(p));
   return { info: { ...info, path: p, groups: audioGroups(info) }, edit: editFor(p), title: await titleOf(p) };
 }));
-ipcMain.handle('qt-close', (_e, p) => { qtFiles.delete(editKey(p)); closeUnusedFds(); });
+ipcMain.handle('qt-close', (_e, p) => { qtFiles.delete(editKey(p)); closeUnusedFds(); renamePending(p); });
 ipcMain.handle('qt-wave', wrap(async (_e, p, dur, buckets, tracks) => {
   if (!qtFiles.has(editKey(p))) throw new Error('Not open.');
   return { peaks: await waveform(p, dur, Math.max(50, Math.min(4000, buckets | 0)), tracks) };
@@ -1594,10 +1813,18 @@ ipcMain.handle('clip-rename', wrap(async (_e, p, title) => {
   if (!allowed(p) || !fs.existsSync(p)) throw new Error("That clip isn't there anymore.");
   const st = fs.statSync(p);
   const { e } = await fileFacts(p, path.basename(p), st);
-  const all = names.all(), key = nameKey(st, e.meta), t = cleanTitle(title);
+  const all = names.all(), key = nameKey(st, e.meta, e.tags), t = cleanTitle(title);
   if (t) all[key] = t; else delete all[key];
   names.save();
   dropPrepared(p); // ready-made copies carry the old name
+  pendingNames.delete(editKey(p));
+  // Settings > File names: the file is renamed too (an open clip once the editor lets go of it)
+  if (t && renameFiles() && targetName(p, t)) {
+    await keepFacts(p);
+    if (qtFiles.has(editKey(p))) { pendingNames.set(editKey(p), { p, title: t }); return { title: t, pending: true }; }
+    const to = targetName(p, t);
+    if (to) { moveNow(p, to); return { title: t, path: to, name: path.basename(to), url: pathToFileURL(to).href }; }
+  }
   return { title: t || null };
 }));
 ipcMain.handle('person-name', wrap(async (_e, id, name) => {
@@ -1665,15 +1892,14 @@ async function clipFor(p) {
   if (!VIDEO_EXT.includes(path.extname(p).slice(1).toLowerCase())) throw new Error(`${path.basename(p)} isn't a video the app can open.`);
   const { e } = await fileFacts(p, path.basename(p), st);
   const meta = e.meta || null;
-  const nv = path.basename(p).match(NV_DATE);
-  const date = meta && meta.createdAt ? meta.createdAt : nv ? new Date(+nv[1], +nv[2] - 1, +nv[3], +nv[4], +nv[5], +nv[6]).getTime() : st.mtimeMs;
   if (!inLibrary(p)) opened.add(editKey(p));
   const lib = (await libFolders()).find(f => !f.missing && inside(f.path, p));
+  const f = clipFacts(path.basename(p), st, e, null, lib && lib.kind);
   return {
-    path: p, root: lib ? lib.path : null, url: pathToFileURL(p).href, name: path.basename(p), sub: '', date, size: st.size,
-    source: lib ? lib.kind : 'file', kind: clipKind(path.basename(p), meta), origin: clipOrigin(path.basename(p), meta, lib && lib.kind),
-    gameName: meta && meta.app ? cleanGame(meta.app) : lib ? '' : 'Opened file', game: '', duration: e.duration || null,
-    users: meta ? meta.users : [], edit: editFor(p), title: names.all()[nameKey(st, meta)] || null, external: !lib,
+    path: p, root: lib ? lib.path : null, url: pathToFileURL(p).href, name: path.basename(p), sub: '', date: f.date, size: st.size,
+    source: lib ? lib.kind : 'file', kind: f.kind, type: f.type, edited: f.edited, origin: f.origin,
+    gameName: meta && meta.app ? cleanGame(meta.app) : f.fromName || f.game !== 'Other' ? f.game : lib ? '' : 'Opened file', game: '', duration: e.duration || null,
+    users: meta ? meta.users : [], edit: editFor(p), title: names.all()[nameKey(st, meta, e.tags)] || null, external: !lib,
   };
 }
 ipcMain.handle('open-path', wrap(async (_e, p) => ({ clip: await clipFor(p) })));
@@ -1745,7 +1971,6 @@ ipcMain.handle('lib-action', wrap(async (_e, action, p) => {
   return {};
 }));
 // ---------- deleting (always to the Recycle Bin, always after asking) ----------
-const fmtMB = b => b >= 1073741824 ? (b / 1073741824).toFixed(2) + ' GB' : (b / 1048576).toFixed(1) + ' MB';
 function folderStats(dir) {
   const st = { videos: 0, other: 0, bytes: 0 };
   const walk = d => {
@@ -1855,6 +2080,8 @@ ipcMain.handle('lib-add-folder', wrap(async () => {
   return { changed: true, added: p };
 }));
 ipcMain.handle('lib-remove-folder', wrap(async (_e, p) => {
+  const ex = await oldExportsDir();
+  if (ex && samePath(p, ex)) { const s = readSettings(); s.oldExportsOff = true; writeSettings(s); return { changed: true }; }
   const cur = await libFolders();
   await setFolders(cur.map(f => f.path).filter(x => !samePath(x, p)));
   return { changed: true };
@@ -1863,29 +2090,6 @@ function dirSize(d) {
   let n = 0, files = 0;
   try { for (const f of fs.readdirSync(d)) { try { n += fs.statSync(path.join(d, f)).size; files++; } catch (e) { /* ignore */ } } } catch (e) { /* none yet */ }
   return { bytes: n, files };
-}
-// trims made before the trimmed folder existed, still sitting next to their originals
-async function oldTrims() {
-  const ex = await exportDir(), out = [];
-  for (const f of await libFolders()) {
-    if (f.kind === 'trimmed' || f.missing) continue;
-    const walk = (d, depth) => {
-      let ents = [];
-      try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
-      for (const e of ents) {
-        const full = path.join(d, e.name);
-        if (e.isDirectory()) { if (depth < 4 && !samePath(full, ex)) walk(full, depth + 1); }
-        else if (/_trim\d*\.(mp4|mkv|mov|webm|m4v)$/i.test(e.name)) out.push(full);
-      }
-    };
-    walk(f.path, 0);
-  }
-  return out;
-}
-async function moveFile(from, to) {
-  try { fs.renameSync(from, to); return; } catch (e) { if (e.code !== 'EXDEV') throw e; }
-  await fs.promises.copyFile(from, to, fs.constants.COPYFILE_EXCL); // other drive: copy, then remove
-  fs.unlinkSync(from);
 }
 ipcMain.on('app-name', e => { e.returnValue = APP_NAME; });
 // running from source (the test copy) rather than the installed app
@@ -1900,52 +2104,14 @@ ipcMain.handle('win', (_e, what) => {
   else if (what === 'fullscreen') win.setFullScreen(!win.isFullScreen());
   return { zoom: wc.getZoomLevel(), fullscreen: win.isFullScreen() };
 });
-ipcMain.handle('old-trims', wrap(async () => {
-  const list = await oldTrims();
-  return { count: list.length, bytes: list.reduce((n, p) => { try { return n + fs.statSync(p).size; } catch (e) { return n; } }, 0) };
-}));
-ipcMain.handle('move-old-trims', wrap(async () => {
-  const list = await oldTrims();
-  let moved = 0;
-  const failed = [];
-  for (const p of list) {
-    if (qtFiles.has(editKey(p))) { failed.push(path.basename(p) + ': open in the editor'); continue; }
-    try {
-      const dir = path.join(await exportDir(), await gameFolderFor(p));
-      fs.mkdirSync(dir, { recursive: true });
-      let to = path.join(dir, path.basename(p));
-      for (let n = 2; fs.existsSync(to); n++) to = path.join(dir, path.basename(p, path.extname(p)) + ` (${n})` + path.extname(p));
-      await moveFile(p, to);
-      moved++;
-    } catch (e) { failed.push(path.basename(p) + ': ' + e.message); }
-  }
-  return { moved, failed };
-}));
-ipcMain.handle('export-pick-dir', wrap(async () => {
-  const r = await dialog.showOpenDialog(win, {
-    title: 'Where should trimmed clips go?', defaultPath: await exportDir(), properties: ['openDirectory', 'createDirectory'],
-  });
-  if (r.canceled || !r.filePaths[0]) return { changed: false };
-  const s = readSettings(); s.exportDir = r.filePaths[0]; writeSettings(s);
-  return { changed: true };
-}));
-ipcMain.handle('export-open-dir', wrap(async () => {
-  const d = await exportDir();
-  fs.mkdirSync(d, { recursive: true });
-  const err = await shell.openPath(d);
-  if (err) throw new Error(err);
-  return {};
-}));
-
 ipcMain.handle('settings-get', wrap(async () => {
   const s = readSettings();
   return {
-    exportDir: await exportDir(), exportDirCustom: !!s.exportDir,
     version: app.getVersion(),
     discordIdDetected: s.discordId || null, discordIdManual: s.discordIdManual || null,
     folders: await libFolders(), detected: await detectedFolders(), custom: Array.isArray(s.folders),
     cache: dirSize(thumbDir()),
-    updateMode: updateMode(), updates: !!updater, deleteMode: deleteMode(), editSave: s.editSave === 'auto' ? 'auto' : 'manual',
+    updateMode: updateMode(), updates: !!updater, deleteMode: deleteMode(), editSave: s.editSave === 'auto' ? 'auto' : 'manual', renameFiles: s.renameFiles === true,
   };
 }));
 ipcMain.handle('settings-set', wrap(async (_e, patch) => {
@@ -1958,6 +2124,7 @@ ipcMain.handle('settings-set', wrap(async (_e, patch) => {
   if (patch && UPDATE_MODES.includes(patch.updateMode)) s.updateMode = patch.updateMode;
   if (patch && ['recycle', 'delete'].includes(patch.deleteMode)) s.deleteMode = patch.deleteMode;
   if (patch && ['manual', 'auto'].includes(patch.editSave)) s.editSave = patch.editSave;
+  if (patch && typeof patch.renameFiles === 'boolean') s.renameFiles = patch.renameFiles;
   writeSettings(s);
   if (patch && patch.updateMode) {
     sendUpdate();

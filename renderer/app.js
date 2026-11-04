@@ -17,6 +17,7 @@ const ICONS = {
   draw: `<svg viewBox="0 0 24 24"><path ${S} d="M14.5 5.5l4 4L9.5 18.5H5.5v-4zM12.5 7.5l4 4"/></svg>`,
   select: `<svg viewBox="0 0 24 24"><path ${S} d="M5.5 3.5l13 7.5-5.8 1.3 3.3 6.2-2.4 1.3-3.3-6.2-4.8 4z"/></svg>`,
   razor: `<svg viewBox="0 0 24 24"><circle ${S} cx="6" cy="6" r="2.8"/><circle ${S} cx="6" cy="18" r="2.8"/><path ${S} d="M8.2 7.8L20 18M8.2 16.2L20 6"/></svg>`,
+  unlink: `<svg viewBox="0 0 24 24"><path ${S} d="M9.5 6.5l1.8-1.8a4 4 0 0 1 5.7 5.7l-1.8 1.8M14.5 17.5l-1.8 1.8a4 4 0 0 1-5.7-5.7l1.8-1.8M3.5 3.5l2.2 2.2M18.3 18.3l2.2 2.2"/></svg>`,
   snap: `<svg viewBox="0 0 24 24"><path ${S} d="M6 4v8a6 6 0 0 0 12 0V4M6 8h4M14 8h4"/></svg>`,
   fit: `<svg viewBox="0 0 24 24"><path ${S} d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5M8 12h8"/></svg>`,
   fadeIn: `<svg viewBox="0 0 24 24"><path ${S} d="M3.5 19.5l9-14h8M3.5 19.5h17"/></svg>`,
@@ -25,6 +26,8 @@ const ICONS = {
   up: `<svg viewBox="0 0 24 24"><path ${S} d="M12 19.5v-15M5.5 11L12 4.5l6.5 6.5"/></svg>`,
   undo: `<svg viewBox="0 0 24 24"><path ${S} d="M9 14L4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>`,
   redo: `<svg viewBox="0 0 24 24"><path ${S} d="M15 14l5-5-5-5M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/></svg>`,
+  lock: `<svg viewBox="0 0 24 24"><rect ${S} x="5" y="10.5" width="14" height="10" rx="2"/><path ${S} d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3"/></svg>`,
+  unlock: `<svg viewBox="0 0 24 24"><rect ${S} x="5" y="10.5" width="14" height="10" rx="2"/><path ${S} d="M8.5 10.5V7.5a3.5 3.5 0 0 1 6.8-1.2"/></svg>`,
   eye: `<svg viewBox="0 0 24 24"><path ${S} d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle ${S} cx="12" cy="12" r="3"/></svg>`,
   eyeOff: `<svg viewBox="0 0 24 24"><path ${S} d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><path ${S} d="M4 4l16 16"/></svg>`,
   points: `<svg viewBox="0 0 24 24"><path ${S} d="M3 17l5-6 4 3 4-7 5 5"/><g fill="currentColor"><circle cx="8" cy="11" r="1.8"/><circle cx="12" cy="14" r="1.8"/><circle cx="16" cy="7" r="1.8"/></g></svg>`,
@@ -80,7 +83,15 @@ const ICONS = {
   replace: `<svg viewBox="0 0 24 24"><path ${S} d="M4.5 9.5a7.5 7.5 0 0 1 13.2-3.2M19.5 4v4h-4M19.5 14.5a7.5 7.5 0 0 1-13.2 3.2M4.5 20v-4h4"/></svg>`,
   checkCircle: `<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" fill="currentColor"/><path d="M7.5 12.3l3 3 6-6.3" fill="none" stroke="#0e0e10" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
 };
-function setIco(el, name) { if (el.dataset.ico !== name || !el.firstChild) { el.dataset.ico = name; el.innerHTML = ICONS[name] || ''; } }
+// icons are parsed once and cloned after that (parsing the SVG for every card was slow)
+const ICON_TPL = new Map();
+function setIco(el, name) {
+  if (el.dataset.ico === name && el.firstChild) return;
+  el.dataset.ico = name;
+  let t = ICON_TPL.get(name);
+  if (!t) { t = document.createElement('template'); t.innerHTML = ICONS[name] || ''; ICON_TPL.set(name, t); }
+  el.replaceChildren(t.content.cloneNode(true));
+}
 document.querySelectorAll('[data-ico]').forEach(el => { el.innerHTML = ICONS[el.dataset.ico] || ''; });
 const icoSpan = name => { const s = document.createElement('span'); s.className = 'ico'; setIco(s, name); return s; };
 

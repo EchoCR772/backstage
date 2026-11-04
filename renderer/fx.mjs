@@ -11,7 +11,9 @@
 // module also runs the asset panel on the left and a Premiere-style timeline across the bottom:
 // V1 is the clip itself (its trim edges, with its zooms on it), layer tracks above it (V2 and up)
 // hold text, pictures, shapes, blur and drawings, A1..An are the clip's own sounds (linked to V1,
-// with volume lines) and the tracks under them hold added sounds. Items move in time and between
+// with volume lines) and the tracks under them hold added sounds. The razor cuts the clip's own
+// sound rows into pieces (edit.fx.cuts): a piece plays its part of the row (from..to, clip time) at
+// `at`. A row stays linked to the video (its pieces can't slide out of step) until it's unlinked. Items move in time and between
 // tracks and never overlap on one track. The timeline zooms (slider, Ctrl+wheel) and scrolls
 // (overview strip, Shift+wheel).
 // Uses the page's shared helpers (h, icoSpan, fmt, parse, T, openMenu).
@@ -32,13 +34,14 @@ const NAMES = { zoom: 'Zoom', text: 'Text', image: 'Picture', shape: 'Shape', bl
 const ICON = { zoom: 'zoom', text: 'text', image: 'image', shape: 'shape', blur: 'blur', draw: 'draw', sound: 'music' };
 const OVER = new Set(['text', 'image', 'shape', 'draw']);
 const SWATCHES = ['#ffffff', '#000000', '#f23f43', '#f0b232', '#23a55a', '#00a8fc', '#5865f2', '#eb459e'];
-const CROPS = [['Free', 0], ['16:9', 16 / 9], ['9:16', 9 / 16], ['1:1', 1], ['4:3', 4 / 3]];
+// crop shapes: [value, label]; 'orig' = the clip's own shape (for resizing without changing it)
+const CROPS = [[0, 'Free'], ['orig', 'Original'], [16 / 9, '16:9'], [9 / 16, '9:16'], [1, '1:1'], [4 / 3, '4:3'], [3 / 4, '3:4'], [4 / 5, '4:5'], [21 / 9, '21:9']];
 const SHAPES = [['rect', 'Box'], ['round', 'Rounded'], ['ellipse', 'Circle'], ['line', 'Line'], ['arrow', 'Arrow']];
 const FADE = 0.5;
 const SNAP = 6;          // pixels
 const MIN_SPAN = 1;      // the most the timeline zooms in: this many seconds across
 
-export const emptyFx = () => ({ crop: null, layers: [], sounds: [], vpts: {}, fades: {}, vtracks: [], atracks: [] });
+export const emptyFx = () => ({ crop: null, layers: [], sounds: [], vpts: {}, fades: {}, vtracks: [], atracks: [], cuts: {} });
 // volume at time t from points [[t, v], ...] (straight lines between them, flat outside)
 export function curveAt(pts, t) {
   if (!pts || !pts.length) return 1;
@@ -48,6 +51,18 @@ export function curveAt(pts, t) {
   }
   return pts[pts.length - 1][1];
 }
+// A zoom can have steps: { t (clip time), box, ease (seconds) }. From each step's time the zoom moves
+// on from where it was to that step's box over `ease` (smoothstep), so one zoom can go 2x, then 3x,
+// then 4x into the same spot. The zoom's own box is the first stage.
+export function zoomBoxAt(z, t) {
+  let b = z.box;
+  for (const s of z.steps || []) {
+    if (t < s.t || s.t <= z.start || s.t >= z.end) continue;
+    const u = smooth(s.ease > 0.001 ? clamp01((t - s.t) / s.ease) : 1);
+    b = { x: b.x + (s.box.x - b.x) * u, y: b.y + (s.box.y - b.y) * u, w: b.w + (s.box.w - b.w) * u, h: b.h + (s.box.h - b.h) * u };
+  }
+  return b;
+}
 // the part of the (cropped) frame showing at time t, the same way main's zoompan does it
 export function zoomAt(layers, t, vtracks) {
   let w = 1, x = 0, y = 0;
@@ -55,8 +70,8 @@ export function zoomAt(layers, t, vtracks) {
     if (z.type !== 'zoom' || z.hidden || t < z.start || t >= z.end) continue;
     const half = (z.end - z.start) / 2, a = Math.min(z.ein, half), b = Math.min(z.eout, half);
     const rin = a > 0.001 ? clamp01((t - z.start) / a) : 1, rout = b > 0.001 ? clamp01((z.end - t) / b) : 1;
-    const e = smooth(Math.min(rin, rout));
-    w -= e * (1 - z.box.w); x += e * z.box.x; y += e * z.box.y;
+    const e = smooth(Math.min(rin, rout)), bx = zoomBoxAt(z, t);
+    w -= e * (1 - bx.w); x += e * bx.x; y += e * bx.y;
   }
   w = clamp(w, 0.02, 1);
   return { x: clamp(x, 0, 1 - w), y: clamp(y, 0, 1 - w), w, h: w };
@@ -164,26 +179,34 @@ export function createFx(ctx) {
   // ctx: { Q, seekTo(t), pause(), toggle(), changed(), status(), audioChanged(), canvas(), info(),
   //        gainsChanged(), canUndo(), canRedo() }
   const F = {
-    fx: emptyFx(), sel: null, tool: null, drag: null, cropAspect: 0, draft: null, peaks: new Map(), ver: 0, drawKey: '',
+    fx: emptyFx(), sel: null, tool: null, drag: null, cropAspect: 0, cropLock: false, draft: null, peaks: new Map(), ver: 0, drawKey: '',
     brush: { c: '#f23f43', s: 0.008, e: false }, clipboard: null,
     on: false, v: { t0: 0, t1: 1 }, mode: 'select', snapOn: lsGet('fxSnap', true), tab: lsGet('fxTab', 'text'), panelOff: false,
   };
   const Q = ctx.Q;
   const view = $('qtview'), edit = $('qtedit'), levels = $('qtlevels'), tracksEl = $('qttracks');
 
-  const find = id => F.fx.layers.find(l => l.id === id) || F.fx.sounds.find(s => s.id === id) || null;
+  // pieces of the clip's own sound rows (after a razor cut): { id, ckey (the row), from, to, at }
+  const pieceList = () => Object.values(F.fx.cuts).flatMap(c => c.pieces);
+  const find = id => F.fx.layers.find(l => l.id === id) || F.fx.sounds.find(s => s.id === id) || pieceList().find(p => p.id === id) || null;
   const selected = () => (F.sel ? find(F.sel) : null);
   const isSound = x => !!x && x.path !== undefined;
+  const isPiece = x => !!x && x.ckey !== undefined;
+  // one of the clip's own sound rows selected on the timeline ('row:<key>'): its group, or null
+  const selRow = () => (F.sel && F.sel.startsWith('row:') ? Q.groups.find(g => 'row:' + g.key === F.sel) || null : null);
+  const cutOf = key => F.fx.cuts[key] || null;
   const info = () => ctx.info() || {};
   const out = () => outSize(info(), F.fx.crop);
   const aspect = () => { const o = out(); return o.w / o.h; };
   const bump = () => { F.ver++; };
-  const span = x => (isSound(x) ? { start: x.at, end: x.at + (x.to - x.from) } : { start: x.start, end: x.end });
+  const span = x => (isSound(x) || isPiece(x) ? { start: x.at, end: x.at + (x.to - x.from) } : { start: x.start, end: x.end });
   const vt = i => F.fx.vtracks[i] || (F.fx.vtracks[i] = {});
   const at = i => F.fx.atracks[i] || (F.fx.atracks[i] = {});
   // zooms live on V1 (the clip), the other layers on the layer tracks
-  const kindOf = x => (isSound(x) ? 'a' : x.type === 'zoom' ? 'z' : 'v');
-  const pool = kind => (kind === 'a' ? F.fx.sounds : F.fx.layers.filter(l => (kind === 'z') === (l.type === 'zoom')));
+  // a piece's kind is its row ('p:<row key>'): pieces only move along their own row
+  const kindOf = x => (isPiece(x) ? 'p:' + x.ckey : isSound(x) ? 'a' : x.type === 'zoom' ? 'z' : 'v');
+  const pool = kind => (kind.startsWith('p:') ? (cutOf(kind.slice(2)) || { pieces: [] }).pieces
+    : kind === 'a' ? F.fx.sounds : F.fx.layers.filter(l => (kind === 'z') === (l.type === 'zoom')));
   const vHidden = l => !!l.hidden || (l.type !== 'zoom' && !!(F.fx.vtracks[l.track || 0] && F.fx.vtracks[l.track || 0].hidden));
   const aMuted = s => !!s.mute || !!(F.fx.atracks[s.track || 0] && F.fx.atracks[s.track || 0].mute);
 
@@ -195,10 +218,20 @@ export function createFx(ctx) {
     for (const k of ['layers', 'sounds', 'vtracks', 'atracks']) if (!Array.isArray(F.fx[k])) F.fx[k] = [];
     for (const k of ['vpts', 'fades']) if (!F.fx[k] || typeof F.fx[k] !== 'object') F.fx[k] = {};
     delete F.fx.ctracks;
-    for (const l of F.fx.layers) { l.track = l.type === 'zoom' ? 0 : l.track | 0; if (l.type === 'image' && l.url) imageFor(l.url); }
+    for (const l of F.fx.layers) {
+      l.track = l.type === 'zoom' ? 0 : l.track | 0;
+      if (l.type === 'image' && l.url) imageFor(l.url);
+      if (l.type === 'zoom') { if (!Array.isArray(l.steps)) delete l.steps; else l.steps.sort((a, b) => a.t - b.t); }
+    }
     for (const s of F.fx.sounds) { s.track = s.track | 0; if (!Array.isArray(s.pts)) s.pts = []; }
+    if (!F.fx.cuts || typeof F.fx.cuts !== 'object' || Array.isArray(F.fx.cuts)) F.fx.cuts = {};
+    for (const [k, c] of Object.entries(F.fx.cuts)) {
+      if (!c || !Array.isArray(c.pieces)) { delete F.fx.cuts[k]; continue; }
+      c.free = !!c.free;
+      for (const p of c.pieces) { p.ckey = k; if (!p.id) p.id = uid(); }
+    }
     if (same) {
-      if (F.sel && !F.fx.layers.some(l => l.id === F.sel) && !F.fx.sounds.some(x => x.id === F.sel)) F.sel = null;
+      if (F.sel && !find(F.sel) && !selRow()) F.sel = null;
       bump(); renderAll();
       return;
     }
@@ -206,7 +239,7 @@ export function createFx(ctx) {
     fitView(true);
     renderAll();
   }
-  const hasContent = f => !!(f.crop || f.layers.length || f.sounds.length || Object.values(f.vpts).some(p => p && p.length) || Object.values(f.fades).some(Boolean));
+  const hasContent = f => !!(f.crop || f.layers.length || f.sounds.length || Object.values(f.vpts).some(p => p && p.length) || Object.values(f.fades).some(Boolean) || Object.keys(f.cuts || {}).length);
   // what gets saved: null when there's nothing
   function state() {
     const f = F.fx;
@@ -215,7 +248,7 @@ export function createFx(ctx) {
     for (const [k, p] of Object.entries(f.vpts)) if (p && p.length) vpts[k] = p;
     const fades = {};
     for (const [k, v] of Object.entries(f.fades)) if (v) fades[k] = v;
-    return copy({ crop: f.crop, layers: f.layers, sounds: f.sounds, vpts, fades, vtracks: f.vtracks, atracks: f.atracks });
+    return copy({ crop: f.crop, layers: f.layers, sounds: f.sounds, vpts, fades, vtracks: f.vtracks, atracks: f.atracks, cuts: f.cuts });
   }
   // every volume curve on the clip's clock (added sounds keep theirs relative to where they start)
   function allPts() {
@@ -297,21 +330,23 @@ export function createFx(ctx) {
   // ---------- handles on the picture ----------
   function renderEdit(w, hh) {
     const sel = selected();
-    const key = [F.ver, F.tool, F.sel, w, hh, sel && !isSound(sel) ? Q.t >= sel.start && Q.t < sel.end : ''].join('|');
+    const key = [F.ver, F.tool, F.sel, w, hh, sel && !isSound(sel) ? Q.t >= sel.start && Q.t < sel.end : '', sel && sel.type === 'zoom' ? stageAt(sel) : ''].join('|');
     if (key === edit.dataset.key) return;
     edit.dataset.key = key;
     edit.replaceChildren();
     edit.className = 'qt-edit' + (F.tool ? ' tool-' + F.tool : '');
-    if (F.tool === 'crop') { edit.append(boxEl(F.draft || F.fx.crop || { x: 0, y: 0, w: 1, h: 1 }, 'fx-cropbox')); return; }
+    if (F.tool === 'crop') { edit.append(boxEl(F.draft || F.fx.crop || { x: 0, y: 0, w: 1, h: 1 }, 'fx-cropbox', true)); return; }
     const l = sel;
-    if (!l || isSound(l) || l.type === 'draw') return;
+    if (!l || isSound(l) || isPiece(l) || l.type === 'draw') return;
     if (l.type !== 'zoom' && !(Q.t >= l.start && Q.t < l.end)) return;
     if (l.type === 'shape' && (l.shape === 'line' || l.shape === 'arrow')) { edit.append(dot('p1', l.x1, l.y1), dot('p2', l.x2, l.y2)); return; }
-    edit.append(boxEl(boxOf(l, aspect()), 'fx-selbox' + (l.type === 'zoom' ? ' zoom' : '')));
+    edit.append(boxEl(l.type === 'zoom' ? zoomTarget(l).box : boxOf(l, aspect()), 'fx-selbox' + (l.type === 'zoom' ? ' zoom' : '')));
   }
-  function boxEl(b, cls) {
+  // edges: the sides can be dragged too (the crop), like resizing a window
+  function boxEl(b, cls, edges) {
     const d = h('div', cls);
     d.style.left = b.x * 100 + '%'; d.style.top = b.y * 100 + '%'; d.style.width = b.w * 100 + '%'; d.style.height = b.h * 100 + '%';
+    if (edges) for (const c of ['n', 's', 'e', 'w']) { const k = h('div', 'fx-edge ' + c); k.dataset.h = c; d.append(k); }
     for (const c of ['nw', 'ne', 'sw', 'se']) { const k = h('div', 'fx-h ' + c); k.dataset.h = c; d.append(k); }
     return d;
   }
@@ -360,17 +395,19 @@ export function createFx(ctx) {
     if (F.tool === 'draw') { drawDown(p); return; }
     if (!F.on) { F.drag = { click: true, wasSel: false }; return; } // Trim: the picture just plays / pauses
     const sel = selected(), hnd = e.target.dataset && e.target.dataset.h;
-    if (hnd && sel) { startDrag(sel, hnd, p); return; }
+    // a zoom's box on the video is the stage under the playhead (its own box or one of its steps)
+    const tgt = sel && sel.type === 'zoom' ? zoomEditTarget(sel) : sel;
+    if (hnd && sel) { startDrag(tgt, hnd, p); return; }
     const hit = hitTest(p);
     if (hit) { select(hit.id, true); startDrag(hit, 'move', p); return; }
-    if (sel && sel.type === 'zoom' && inBox(p, sel.box)) { startDrag(sel, 'move', p); return; }
+    if (sel && sel.type === 'zoom' && inBox(p, tgt.box)) { startDrag(tgt, 'move', p); return; }
     F.drag = { click: true, wasSel: !!F.sel };
   });
   edit.addEventListener('pointermove', e => {
     const d = F.drag;
     if (!d || d.click || d.tl) return;
     const p = norm(e);
-    if (d.draw) drawMove(p); else if (d.crop) cropMove(p); else dragMove(p);
+    if (d.draw) drawMove(p); else if (d.crop) cropMove(p, e); else dragMove(p);
   });
   const endEdit = () => {
     const d = F.drag;
@@ -420,34 +457,58 @@ export function createFx(ctx) {
   function keepInside(b) { b.w = Math.min(1, b.w); b.h = Math.min(1, b.h); b.x = clamp(b.x, 0, 1 - b.w); b.y = clamp(b.y, 0, 1 - b.h); return b; }
 
   // ---------- crop ----------
-  function startCrop() { ctx.pause(); F.tool = 'crop'; F.sel = null; F.cropAspect = 0; bump(); renderAll(); }
+  function startCrop() { ctx.pause(); F.tool = 'crop'; F.sel = null; F.cropAspect = 0; F.cropLock = false; bump(); renderAll(); }
   function endCrop() { F.tool = null; F.draft = null; bump(); renderAll(); ctx.changed(); }
+  const srcAspect = () => { const src = info(); return (src.width || 16) / (src.height || 9); };
   function cropDown(e, p) {
     const b0 = { ...(F.fx.crop || { x: 0, y: 0, w: 1, h: 1 }) }, hnd = e.target.dataset && e.target.dataset.h;
     F.draft = { ...b0 };
     F.drag = { crop: true, mode: hnd || (inBox(p, b0) && !isFull(b0) ? 'move' : 'new'), p0: p, b0 };
   }
-  function cropMove(p) {
-    const d = F.drag, b0 = d.b0, src = info(), sa = (src.width || 16) / (src.height || 9);
+  // the shape a drag keeps (w/h in frame units), or 0: the lock (or a picked shape) keeps one, Shift
+  // does the opposite of the lock while dragging, as in Premiere / Photoshop
+  function cropKeep(e, b0) {
+    const locked = (F.cropLock || !!F.cropAspect) !== !!(e && e.shiftKey);
+    if (!locked) return 0;
+    const r = F.cropAspect === 'orig' ? srcAspect() : F.cropAspect;
+    return r ? r / srcAspect() : b0.w / b0.h;
+  }
+  function cropMove(p, e) {
+    const d = F.drag, b0 = d.b0, k = cropKeep(e, d.mode === 'new' ? { w: 1, h: 1 } : b0);
+    const px = clamp01(p.x), py = clamp01(p.y), MIN = 0.03;
     let b;
     if (d.mode === 'move') b = { ...b0, x: clamp(b0.x + p.x - d.p0.x, 0, 1 - b0.w), y: clamp(b0.y + p.y - d.p0.y, 0, 1 - b0.h) };
-    else {
+    else if (d.mode.length === 1) {
+      // a side: that side moves; with a kept shape the other two sides grow around the middle
+      b = { ...b0 };
+      if (d.mode === 'n') { b.y = Math.min(py, b0.y + b0.h - MIN); b.h = b0.y + b0.h - b.y; }
+      if (d.mode === 's') b.h = Math.max(MIN, py - b0.y);
+      if (d.mode === 'w') { b.x = Math.min(px, b0.x + b0.w - MIN); b.w = b0.x + b0.w - b.x; }
+      if (d.mode === 'e') b.w = Math.max(MIN, px - b0.x);
+      if (k) {
+        if (d.mode === 'n' || d.mode === 's') { const cx = b0.x + b0.w / 2; b.w = Math.min(1, b.h * k); b.h = b.w / k; b.x = cx - b.w / 2; if (d.mode === 'n') b.y = b0.y + b0.h - b.h; }
+        else { const cy = b0.y + b0.h / 2; b.h = Math.min(1, b.w / k); b.w = b.h * k; b.y = cy - b.h / 2; if (d.mode === 'w') b.x = b0.x + b0.w - b.w; }
+      }
+      b = keepInside(b);
+    } else {
+      // a corner (or a new box): the opposite corner stays put
       const ax = d.mode === 'new' ? d.p0.x : d.mode.includes('w') ? b0.x + b0.w : b0.x;
       const ay = d.mode === 'new' ? d.p0.y : d.mode.includes('n') ? b0.y + b0.h : b0.y;
-      const px = clamp01(p.x), py = clamp01(p.y);
-      let w = Math.max(0.03, Math.abs(px - ax)), hh = Math.max(0.03, Math.abs(py - ay));
-      if (F.cropAspect) { const k = F.cropAspect / sa; if (w / hh > k) w = hh * k; else hh = w / k; }
+      let w = Math.max(MIN, Math.abs(px - ax)), hh = Math.max(MIN, Math.abs(py - ay));
+      if (k) { if (w / hh > k) w = hh * k; else hh = w / k; }
       b = keepInside({ x: px < ax ? ax - w : ax, y: py < ay ? ay - hh : ay, w, h: hh });
     }
     F.draft = b;
     edit.dataset.key = '';
     renderProps();
   }
+  // a picked shape: the biggest crop of that shape in the middle, and the lock keeps it
   function cropPreset(r) {
     F.cropAspect = r;
-    const src = info(), sa = (src.width || 16) / (src.height || 9);
-    if (!r) F.fx.crop = null;
-    else { const k = r / sa, w = k >= 1 ? 1 : k, hh = k >= 1 ? 1 / k : 1; F.fx.crop = { x: (1 - w) / 2, y: (1 - hh) / 2, w, h: hh }; }
+    F.cropLock = !!r;
+    const sa = srcAspect(), ratio = r === 'orig' ? sa : r;
+    if (!r || r === 'orig') { if (r === 'orig') F.fx.crop = null; }
+    else { const k = ratio / sa, w = k >= 1 ? 1 : k, hh = k >= 1 ? 1 / k : 1; F.fx.crop = { x: (1 - w) / 2, y: (1 - hh) / 2, w, h: hh }; }
     changed();
   }
 
@@ -470,6 +531,19 @@ export function createFx(ctx) {
     F.drag = { draw: true, s, last: p };
     bump();
   }
+  // the brush outline: a circle the size the stroke will be (dashed for the eraser), in place of a cursor
+  const brushEl = h('div', 'fx-brush'); brushEl.hidden = true; document.body.append(brushEl);
+  function showBrush(e) {
+    if (F.tool !== 'draw' || !F.on) { brushEl.hidden = true; return; }
+    const r = edit.getBoundingClientRect(), d = Math.max(3, F.brush.s * r.height);
+    if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) { brushEl.hidden = true; return; }
+    brushEl.hidden = false;
+    brushEl.classList.toggle('erase', !!F.brush.e);
+    brushEl.style.width = brushEl.style.height = d + 'px';
+    brushEl.style.left = e.clientX + 'px'; brushEl.style.top = e.clientY + 'px';
+  }
+  edit.addEventListener('pointermove', showBrush);
+  edit.addEventListener('pointerleave', () => { brushEl.hidden = true; });
   function drawMove(p) {
     const d = F.drag;
     if (Math.hypot((p.x - d.last.x) * p.rw, (p.y - d.last.y) * p.rh) < 2) return;
@@ -571,8 +645,9 @@ export function createFx(ctx) {
     await addFile(r, pt);
   }
   async function remove(id) {
-    const s = F.fx.sounds.find(x => x.id === id);
+    const s = F.fx.sounds.find(x => x.id === id), p = pieceList().find(x => x.id === id);
     if (s) { F.fx.sounds = F.fx.sounds.filter(x => x !== s); await ctx.audioChanged(); }
+    else if (p) { const c = cutOf(p.ckey); c.pieces = c.pieces.filter(x => x !== p); await ctx.audioChanged(); } // that part goes silent
     else F.fx.layers = F.fx.layers.filter(l => l.id !== id);
     if (F.sel === id) { F.sel = null; if (F.tool === 'draw') F.tool = null; }
     changed();
@@ -590,6 +665,7 @@ export function createFx(ctx) {
     if (!x) return;
     const sp = span(x);
     if (t <= sp.start + 0.05 || t >= sp.end - 0.05) { if (at0 == null) ctx.status('Move the playhead inside the block to split it.', null, 4000); return; }
+    if (isPiece(x)) { const b = cutRow(x.ckey, t); if (b) { F.sel = b.id; ctx.audioChanged(); changed(); } return; }
     const b = copy(x); b.id = uid();
     if (isSound(x)) {
       const cut = x.from + (t - x.at);
@@ -599,6 +675,12 @@ export function createFx(ctx) {
       F.fx.sounds.push(b);
       ctx.audioChanged();
     } else {
+      if (x.type === 'zoom' && x.steps) {
+        // the second part starts from where the first one is at the cut
+        b.box = { ...zoomBoxAt(x, t) };
+        b.steps = x.steps.filter(st => st.t > t);
+        x.steps = x.steps.filter(st => st.t < t);
+      }
       x.end = t; b.start = t;
       if (x.type === 'zoom') { x.eout = Math.min(x.eout, (x.end - x.start) / 2); b.ein = Math.min(b.ein, (b.end - b.start) / 2); }
       delete b.png; delete b.sig;
@@ -609,7 +691,7 @@ export function createFx(ctx) {
   }
   function duplicate(id) {
     const x = find(id);
-    if (!x) return;
+    if (!x || isPiece(x)) return;
     const b = copy(x); b.id = uid(); delete b.png; delete b.sig;
     const sp = span(x), len = sp.end - sp.start, kind = kindOf(x);
     const s = fitAt(kind, x.track | 0, sp.end, len, null);
@@ -620,8 +702,13 @@ export function createFx(ctx) {
     if (kind === 'a') ctx.audioChanged();
     changed();
   }
-  function setStart(x, s) { if (isSound(x)) x.at = s; else { const len = x.end - x.start; x.start = s; x.end = s + len; } }
-  function copyBlock(id) { const x = find(id); if (x) { F.clipboard = copy(x); ctx.status(`${NAMES[isSound(x) ? 'sound' : x.type]} copied. Ctrl+V pastes it at the playhead.`, null, 3000); } }
+  function setStart(x, s) {
+    if (isSound(x) || isPiece(x)) { x.at = s; return; }
+    const len = x.end - x.start, d = s - x.start;
+    x.start = s; x.end = s + len;
+    for (const st of x.steps || []) st.t += d; // a zoom's steps go with it
+  }
+  function copyBlock(id) { const x = find(id); if (x && isPiece(x)) { ctx.status("A piece of the clip's own sound can't be copied. Add the sound as its own audio to copy it.", null, 4000); return; } if (x) { F.clipboard = copy(x); ctx.status(`${NAMES[isSound(x) ? 'sound' : x.type]} copied. Ctrl+V pastes it at the playhead.`, null, 3000); } }
   function paste() {
     if (!F.clipboard) return false;
     const b = copy(F.clipboard); b.id = uid(); delete b.png; delete b.sig;
@@ -636,6 +723,68 @@ export function createFx(ctx) {
     return true;
   }
   window.addEventListener('blur', () => { F.clipboard = null; }); // copied something elsewhere: Ctrl+V pastes that
+
+  // ---------- cutting the clip's own sound rows ----------
+  // a row's pieces; a row that was never cut gets one piece: all of it, in step with the video
+  function cutsFor(key) {
+    return F.fx.cuts[key] || (F.fx.cuts[key] = { free: false, pieces: [{ id: uid(), ckey: key, from: 0, to: Q.dur, at: 0 }] });
+  }
+  // a row left whole and in step again needs no cuts entry
+  function tidyCuts(key) {
+    const c = cutOf(key), p = c && c.pieces[0];
+    if (c && !c.free && c.pieces.length === 1 && p.from < 0.001 && p.to > Q.dur - 0.001 && Math.abs(p.at - p.from) < 1e-6) delete F.fx.cuts[key];
+  }
+  // cut a row at t (timeline time); the piece after the cut, or null when t isn't inside a piece
+  function cutRow(key, t) {
+    const had = !!cutOf(key), c = cutsFor(key);
+    const p = c.pieces.find(x => t > x.at + 0.05 && t < x.at + (x.to - x.from) - 0.05);
+    if (!p) { if (!had) delete F.fx.cuts[key]; return null; }
+    const cut = p.from + (t - p.at), b = { id: uid(), ckey: key, from: cut, to: p.to, at: t };
+    p.to = cut;
+    c.pieces.push(b);
+    return b;
+  }
+  // the razor on sound rows (Shift: every row, like Premiere's Shift+click)
+  function razorRows(keys, t) {
+    let last = null;
+    for (const k of keys) { const b = cutRow(k, t); if (b) last = b; }
+    if (!last) return false;
+    F.sel = last.id;
+    ctx.audioChanged(); changed();
+    return true;
+  }
+  // linked: the row's pieces stay in step with the video. Linking puts them back where they came
+  // from (when they fit there).
+  function setLinked(key, linked) {
+    const c = cutsFor(key);
+    if (linked) {
+      const back = c.pieces.map(p => ({ s: p.from, e: p.to }));
+      const fits = back.every((a, i) => back.every((b, j) => i === j || a.e <= b.s + 1e-6 || a.s >= b.e - 1e-6));
+      if (fits) for (const p of c.pieces) p.at = p.from;
+      else ctx.status('Some pieces overlap where they came from, so they stay where they are.', null, 6000);
+    }
+    c.free = !linked;
+    tidyCuts(key);
+    if (F.sel && !find(F.sel)) F.sel = null;
+    ctx.audioChanged(); changed();
+  }
+  function restoreRow(key) {
+    delete F.fx.cuts[key];
+    if (F.sel && !find(F.sel)) F.sel = null;
+    ctx.audioChanged(); changed();
+  }
+  const rowName = key => { const g = Q.groups.find(x => x.key === key); return g ? g.name : 'this row'; };
+  // "Volume..." in a menu: the selected sound's volume slider in Properties
+  function focusVolume() { requestAnimationFrame(() => { const r = $('qtfxprops').querySelector('.fx-vol input[type=range]'); if (r) r.focus(); }); }
+  // volume (0-200 %) and mute in Properties, for a row, a piece or an added sound
+  function volumeRows(box, vol, muted, setVol, toggleMute) {
+    const before = box.children.length;
+    rangeRow(box, 'Volume', vol * 100, 0, 200, v => setVol(v / 100), '%');
+    const r = box.children[before]; r.classList.add('fx-vol');
+    r.querySelector('input').ondblclick = e => { e.target.value = 100; e.target.oninput(); changed(); };
+    const m = iconBtn(muted ? 'speakerOff' : 'speaker', muted ? 'Unmute' : 'Mute', toggleMute);
+    m.classList.toggle('off', muted); r.append(m);
+  }
 
   // ---------- the timeline (Edit) ----------
   const rulerEl = $('etlruler'), ovEl = $('etlov'), phEl = $('etlph');
@@ -675,7 +824,7 @@ export function createFx(ctx) {
     const tol = SNAP / laneRect().width * vspan();
     const cands = [0, Q.dur, Q.t];
     if (skip !== 'trim') cands.push(Q.tin, Q.tout);
-    for (const x of [...F.fx.layers, ...F.fx.sounds]) if (x.id !== skip) { const sp = span(x); cands.push(sp.start, sp.end); }
+    for (const x of [...F.fx.layers, ...F.fx.sounds, ...pieceList()]) if (x.id !== skip) { const sp = span(x); cands.push(sp.start, sp.end); }
     let best = null;
     for (const c of cands) if (Math.abs(c - t) < tol && (best === null || Math.abs(c - t) < Math.abs(best - t))) best = c;
     return best ?? t;
@@ -754,6 +903,13 @@ export function createFx(ctx) {
       a.style.width = (x.ein / (x.end - x.start)) * 100 + '%'; z.style.width = (x.eout / (x.end - x.start)) * 100 + '%';
       a.append(edgeGrip('ein')); z.append(edgeGrip('eout'));
       b.append(a, z);
+      (x.steps || []).forEach((st, i) => {
+        if (st.t <= x.start || st.t >= x.end) return;
+        const dm = h('div', 'trk-zs' + (F.sel === x.id && stageAt(x) === i ? ' on' : ''));
+        dm.dataset.zs = i; dm.style.left = (st.t - x.start) / (x.end - x.start) * 100 + '%';
+        dm.title = `Step ${i + 2} at ${fmt(st.t)}: click to edit it, drag to move it`;
+        b.append(dm);
+      });
     }
     if (sound) for (const [i, [dt, v]] of (x.pts || []).entries()) b.append(pointEl(i, (dt / (sp.end - sp.start)) * 100, v, `${Math.round(v * 100)}%`));
     return b;
@@ -796,22 +952,37 @@ export function createFx(ctx) {
     return row;
   }
   function soundRow(g, i) {
-    const row = h('div', 'trow c' + (g.mute ? ' muted' : ''));
+    const cut = cutOf(g.key);
+    const row = h('div', 'trow c' + (g.mute ? ' muted' : '') + (cut ? ' cut' : '') + (cut && cut.free ? ' free' : ''));
     row.dataset.kind = 'c'; row.dataset.key = g.key;
     const hd = head(`A${i + 1}`, g.name);
+    if (cut && cut.free) { const u = h('span', 'trk-unl'); u.append(icoSpan('unlink')); u.title = 'Unlinked from the video: its pieces can slide. Right-click a piece > Link to Video to put it back in step.'; hd.querySelector('.trk-name').after(u); }
     hd.append(offBtn(g.mute, ['speaker', 'speakerOff'], ['Mute', 'Unmute'], () => ctx.toggleRow(g.key)));
     const lane = h('div', 'trk-l');
     const c = h('canvas', 'trk-wave');
     lane.append(c);
     shades(lane);
-    const b = clipBlock('ab');
-    b.title = `${g.name}. Double-click to add a volume point, drag points up and down, right-click one to remove it.`;
-    lane.append(b);
+    if (cut) for (const p of cut.pieces) lane.append(pieceBlock(p, g, cut));
+    else {
+      const b = clipBlock('ab');
+      b.classList.toggle('sel', F.sel === 'clip' || F.sel === 'row:' + g.key);
+      b.title = `${g.name}. Click it for its volume. Double-click to add a volume point, drag points up and down, right-click one to remove it. The razor (C) cuts it.`;
+      lane.append(b);
+    }
     (F.fx.vpts[g.key] || []).forEach(([pt, v], j) => { const d = pointEl(j, pct(pt), v, `${Math.round(v * 100)}% at ${fmt(pt)}`); lane.append(d); });
     requestAnimationFrame(() => drawClipLane(c, g));
     if (!F.peaks.has('c:' + g.key)) loadClipPeaks(g);
     row.append(hd, lane);
     return row;
+  }
+  function pieceBlock(p, g, c) {
+    const sp = span(p);
+    const b = h('div', 'trk-b pc' + (c.free ? ' free' : '') + (F.sel === p.id ? ' sel' : '') + (p.mute ? ' off' : ''));
+    b.dataset.id = p.id;
+    b.style.left = pct(sp.start) + '%'; b.style.width = Math.max(0.2, wpct(sp.end - sp.start)) + '%';
+    b.title = `${g.name} (${fmt(sp.start)} to ${fmt(sp.end)}). ` + (c.free ? 'Drag it to slide it, drag its ends to shorten it.' : 'Drag its ends to shorten it. Right-click > Unlink from Video to slide it.');
+    b.append(edgeGrip('s'), edgeGrip('e'));
+    return b;
   }
   async function loadClipPeaks(g) {
     const k = 'c:' + g.key;
@@ -846,9 +1017,11 @@ export function createFx(ctx) {
   function sizeCanvas(c) { const w = c.clientWidth, hh = c.clientHeight, dpr = devicePixelRatio || 1; c.width = Math.max(1, Math.round(w * dpr)); c.height = Math.max(1, Math.round(hh * dpr)); return { w, hh, dpr, g: c.getContext('2d') }; }
   function drawClipLane(c, g) {
     if (!c.isConnected) return;
-    const { w, hh, dpr, g: x } = sizeCanvas(c), pk = F.peaks.get('c:' + g.key);
+    const { w, hh, dpr, g: x } = sizeCanvas(c), pk = F.peaks.get('c:' + g.key), cut = cutOf(g.key);
     x.fillStyle = 'rgba(181,182,188,.5)';
-    waveBars(x, w, hh, dpr, t => peakAt(pk, t, Q.dur));
+    // a cut row: each piece shows its own part of the sound where it sits now
+    const pieceAt = t => cut.pieces.find(p => t >= p.at && t < p.at + (p.to - p.from));
+    waveBars(x, w, hh, dpr, cut ? t => { const p = pieceAt(t); return p ? peakAt(pk, p.from + t - p.at, Q.dur) : null; } : t => peakAt(pk, t, Q.dur));
     const pts = F.fx.vpts[g.key] || [];
     curveLine(x, w, hh, dpr, Q.tin, Q.tout, t => curveAt(pts, t));
   }
@@ -1027,20 +1200,46 @@ export function createFx(ctx) {
     ctx.pause();
     tracksEl.setPointerCapture(e.pointerId);
     const x = b && b.dataset.id !== 'clip' ? find(b.dataset.id) : null;
-    if (F.mode === 'razor') { if (x) split(x.id, snapT(xToT(e), e, x.id)); return; }
+    if (F.mode === 'razor') { razorAt(e, row, x); return; }
+    // a zoom step's diamond: edit that step (the playhead goes to where it has zoomed in), drag to move it
+    if (x && e.target.dataset && e.target.dataset.zs !== undefined) {
+      const i = +e.target.dataset.zs, st = x.steps[i];
+      if (F.sel !== x.id) select(x.id, true);
+      ctx.seekTo(Math.min(x.end - 0.01, st.t + st.ease));
+      F.drag = { tl: true, zstep: true, x, i, moved: false };
+      return;
+    }
     if (g === 'ts' || g === 'te') { if (F.sel !== 'clip') select('clip', true); F.drag = { tl: true, trim: g === 'ts' ? 'in' : 'out' }; return; }
     if (row.dataset.kind === 'c' && ptEl) { F.drag = { tl: true, cpt: true, key: row.dataset.key, i: +ptEl.dataset.pt, r: ptEl.parentElement.getBoundingClientRect() }; return; }
     if (!x) {
       // the clip (V1 / its sounds) gets selected, empty space clears the selection; both move the playhead
       const onClip = b && b.dataset.id === 'clip';
-      if ((F.sel || null) !== (onClip ? 'clip' : null)) select(onClip ? 'clip' : null, true);
+      const want = onClip ? (row.dataset.kind === 'c' ? 'row:' + row.dataset.key : 'clip') : null;
+      if ((F.sel || null) !== want) select(want, true);
       ctx.seekTo(xToT(e)); F.drag = { tl: true, seek: true };
       return;
     }
     if (F.sel !== x.id) select(x.id, true);
+    // a linked piece stays in step with the video: dragging it moves the playhead (its ends still trim it)
+    if (isPiece(x) && !g && !cutOf(x.ckey).free) { ctx.seekTo(xToT(e)); F.drag = { tl: true, seek: true }; return; }
     if (ptEl && isSound(x)) { F.drag = { tl: true, spt: true, x, i: +ptEl.dataset.pt }; return; }
     F.drag = { tl: true, g: g || 'move', t0: xToT(e), orig: copy(x), x, moved: false, kind: kindOf(x) };
   });
+  // the razor: added blocks split where clicked; the clip's sound rows are cut (Shift: every sound
+  // row, and every block there); the video itself can't be cut yet
+  function razorAt(e, row, x) {
+    const t = snapT(xToT(e), e, x ? x.id : null);
+    if (e.shiftKey) {
+      const keys = Q.groups.map(g => g.key);
+      let any = keys.length ? razorRows(keys, t) : false;
+      for (const y of [...F.fx.layers, ...F.fx.sounds]) { const sp = span(y); if (t > sp.start + 0.05 && t < sp.end - 0.05) { split(y.id, t); any = true; } }
+      if (!any) ctx.status('Nothing to cut there.', null, 3000);
+      return;
+    }
+    if (x && !isPiece(x)) { split(x.id, t); return; }
+    if (row.dataset.kind === 'c') { razorRows([row.dataset.key], t); return; }
+    if (row.dataset.kind === 'clip') ctx.status("The video itself can't be cut yet. Click a sound row (A1, A2...) to cut it, or Shift+click to cut all of them.", null, 6000);
+  }
   tracksEl.addEventListener('dblclick', e => {
     if (F.mode === 'razor') return;
     // a double-click on a sound adds a volume point there
@@ -1070,6 +1269,14 @@ export function createFx(ctx) {
       return;
     }
     if (d.cpt) { clipPointMove(e); return; }
+    if (d.zstep) {
+      const st = d.x.steps[d.i]; if (!st) return;
+      st.t = clamp(snapT(xToT(e), e, d.x.id), d.x.start + 0.05, d.x.end - 0.05); d.moved = true;
+      d.x.steps.sort((a, b) => a.t - b.t); d.i = d.x.steps.indexOf(st);
+      ctx.seekTo(Math.min(d.x.end - 0.01, st.t + st.ease));
+      bump(); queueTracks(); renderProps();
+      return;
+    }
     if (d.spt) { soundPointMove(e); return; }
     const t = xToT(e), o = d.orig, x = d.x, dt = t - d.t0;
     if (!d.moved && Math.abs(dt) < vspan() * 3 / laneRect().width && !rowChange(e, d)) return;
@@ -1077,7 +1284,7 @@ export function createFx(ctx) {
     if (d.g === 'move') {
       const len = span(o).end - span(o).start;
       let ti = 0;
-      if (d.kind !== 'z') {
+      if (d.kind !== 'z' && !d.kind.startsWith('p:')) {
         // the track under the pointer; past the top layer track / the last sound track: one new
         // track, at most (a block alone on the top track stays there)
         ti = o.track | 0;
@@ -1095,7 +1302,13 @@ export function createFx(ctx) {
       let s = snapT(span(o).start + dt, e, x.id);
       const s2 = snapT(s + len, e, x.id); if (s2 !== s + len) s = s2 - len;
       const ok = fitAt(d.kind, ti, s, len, x.id);
-      if (ok !== null) { setStart(x, ok); x.track = ti; }
+      if (ok !== null) { setStart(x, ok); if (!isPiece(x)) x.track = ti; }
+    } else if (isPiece(x)) {
+      // a piece's ends: the start keeps the sound where it was (from moves with at), never before
+      // the clip's start or past its end
+      const len = o.to - o.from;
+      if (d.g === 's') { const a2 = clamp(snapT(o.at + dt, e, x.id), Math.max(0, o.at - o.from), o.at + len - 0.1); if (free(d.kind, 0, a2, o.at + len - a2, x.id)) { x.from = o.from + (a2 - o.at); x.at = a2; } }
+      else if (d.g === 'e') { const end = clamp(snapT(o.at + len + dt, e, x.id), o.at + 0.1, Math.min(Q.dur, o.at + (Q.dur - o.from))); if (free(d.kind, 0, o.at, end - o.at, x.id)) x.to = o.from + (end - o.at); }
     } else if (isSound(x)) {
       const len = o.to - o.from;
       if (d.g === 's') { const a2 = clamp(snapT(o.at + dt, e, x.id), o.at - o.from, o.at + len - 0.1); if (free('a', x.track | 0, a2, o.at + len - a2, x.id)) { x.from = o.from + (a2 - o.at); x.at = Math.max(0, a2); x.pts = shiftPts(o.pts, o.at - a2, x.to - x.from); } }
@@ -1111,7 +1324,7 @@ export function createFx(ctx) {
     bump(); queueTracks(); renderProps();
   });
   // a block dragged up or down onto another row counts as moved even before it moves in time
-  const rowChange = (e, d) => d.g === 'move' && d.kind !== 'z' && (() => { const r = tracksEl.querySelector(`.trk-b[data-id="${d.x.id}"]`); if (!r) return false; const rr = r.closest('.trow').getBoundingClientRect(); return e.clientY < rr.top || e.clientY >= rr.bottom; })();
+  const rowChange = (e, d) => d.g === 'move' && d.kind !== 'z' && !d.kind.startsWith('p:') && (() => { const r = tracksEl.querySelector(`.trk-b[data-id="${d.x.id}"]`); if (!r) return false; const rr = r.closest('.trow').getBoundingClientRect(); return e.clientY < rr.top || e.clientY >= rr.bottom; })();
   const shiftPts = (pts, by, len) => (pts || []).map(([dt, v]) => [r4(dt + by), v]).filter(p => p[0] >= 0 && p[0] <= len);
   const endTracks = async () => {
     const d = F.drag;
@@ -1120,8 +1333,9 @@ export function createFx(ctx) {
     if (d.seek) return;
     if (d.trim) { ctx.trimDone(d.trim); bump(); renderAll(); return; }
     if (d.cpt || d.spt) { changed(); ctx.gainsChanged(); return; }
+    if (d.zstep) { changed(); return; }
     if (!d.moved) return;
-    if (isSound(d.x)) await ctx.audioChanged();
+    if (isSound(d.x) || isPiece(d.x)) await ctx.audioChanged();
     changed();
   };
   for (const ev of ['pointerup', 'pointercancel', 'lostpointercapture']) tracksEl.addEventListener(ev, endTracks);
@@ -1135,12 +1349,41 @@ export function createFx(ctx) {
       changed(); ctx.gainsChanged();
       return;
     }
+    if (b && b.dataset.id === 'clip' && row && row.dataset.kind === 'c') {
+      // a whole sound row of the clip
+      e.preventDefault();
+      const key = row.dataset.key, t = xToT(e), g = Q.groups.find(x => x.key === key);
+      select('row:' + key, true);
+      openMenu(e.clientX, e.clientY, [
+        { text: g && g.mute ? 'Unmute' : 'Mute', run: () => ctx.toggleRow(key) },
+        { text: 'Volume...', run: focusVolume },
+        '-',
+        { text: 'Cut Here', hint: 'C', run: () => razorRows([key], t) },
+        { text: 'Unlink from Video', run: () => setLinked(key, false) },
+      ]);
+      return;
+    }
     if (!b || b.dataset.id === 'clip') return;
     e.preventDefault();
     const x = find(b.dataset.id);
     if (!x) return;
     select(x.id, true);
+    if (isPiece(x)) {
+      const c = cutOf(x.ckey), t = xToT(e);
+      openMenu(e.clientX, e.clientY, [
+        { text: x.mute ? 'Unmute' : 'Mute', run: () => { x.mute = !x.mute; ctx.gainsChanged(); changed(); } },
+        { text: 'Volume...', run: focusVolume },
+        '-',
+        { text: 'Cut Here', hint: 'C', run: () => razorRows([x.ckey], t) },
+        c.free ? { text: 'Link to Video', run: () => setLinked(x.ckey, true) } : { text: 'Unlink from Video', run: () => setLinked(x.ckey, false) },
+        { text: `Restore Whole ${rowName(x.ckey)}`, run: () => restoreRow(x.ckey) },
+        '-',
+        { text: 'Delete', hint: 'Del', run: () => remove(x.id), cls: 'danger' },
+      ]);
+      return;
+    }
     openMenu(e.clientX, e.clientY, [
+      ...(isSound(x) ? [{ text: x.mute ? 'Unmute' : 'Mute', run: () => { x.mute = !x.mute; ctx.gainsChanged(); ctx.audioChanged(); changed(); } }, { text: 'Volume...', run: focusVolume }, '-'] : []),
       { text: 'Split at Playhead', hint: 'Ctrl+K', run: () => split(x.id) },
       { text: 'Duplicate', hint: 'Ctrl+D', run: () => duplicate(x.id) },
       { text: 'Copy', hint: 'Ctrl+C', run: () => copyBlock(x.id) },
@@ -1188,8 +1431,8 @@ export function createFx(ctx) {
   // ---------- the asset panel (Edit): click to add at the playhead, or drag onto the timeline ----------
   const ASSETS = {
     text: [['text:title', 'Title', 'ta-title'], ['text:caption', 'Caption', 'ta-caption'], ['text:callout', 'CLUTCH', 'ta-callout'], ['text:plain', 'Plain text', 'ta-plain']],
-    shapes: [['shape:rect', 'Box', 'shape'], ['shape:rectf', 'Filled box', 'shape'], ['shape:ellipse', 'Circle', 'shape'], ['shape:arrow', 'Arrow', 'shape'], ['shape:line', 'Line', 'shape'], ['file:image', 'Picture...', 'image']],
-    audio: [['file:audio', 'Add music or a sound...', 'music']],
+    shapes: [['shape:rect', 'Box', 'shape'], ['shape:rectf', 'Filled box', 'shape'], ['shape:ellipse', 'Circle', 'shape'], ['shape:arrow', 'Arrow', 'shape'], ['shape:line', 'Line', 'shape'], ['file:image', 'Picture', 'image']],
+    audio: [['file:audio', 'Add music or a sound', 'music']],
     effects: [['fx:zoom', 'Zoom', 'zoom'], ['fx:blur', 'Blur', 'blur'], ['fx:crop', 'Crop', 'crop'], ['fx:draw', 'Draw', 'draw'], ['fade:vin', 'Fade in', 'fadeIn'], ['fade:vout', 'Fade out', 'fadeOut']],
   };
   const HINTS = {
@@ -1245,7 +1488,8 @@ export function createFx(ctx) {
     for (const [id, label, look] of ASSETS[F.tab] || []) {
       const b = h('button', 'as-tile ' + look);
       const fade = id.startsWith('fade:') && F.fx.fades[id.slice(5)];
-      if (fade || (id === 'fx:crop' && F.fx.crop)) b.classList.add('on');
+      // (with the toolbar under the video gone, the Effects tab shows which tool is in use)
+      if (fade || (id === 'fx:crop' && (F.fx.crop || F.tool === 'crop')) || (id === 'fx:draw' && F.tool === 'draw')) b.classList.add('on');
       if (id.startsWith('text:')) b.append(h('span', 'as-sample', label));
       else { b.append(icoSpan(look === 'shape' ? 'shape' : look), h('span', 'as-name', label)); if (look === 'shape') b.dataset.shape = id.slice(6); }
       b.title = id.startsWith('fade:') ? (fade ? 'On: click to remove' : 'Half a second') : 'Click to add at the playhead';
@@ -1267,6 +1511,29 @@ export function createFx(ctx) {
     const l = selected();
     let title = '';
     if (F.tool === 'crop') { title = 'Crop'; cropProps(box); }
+    else if (selRow()) {
+      const g = selRow(), pts = F.fx.vpts[g.key] || [];
+      title = g.name;
+      volumeRows(box, g.vol, g.mute, v => ctx.rowVolume(g.key, v), () => ctx.toggleRow(g.key));
+      box.append(h('div', 'fx-hint', 'Double-click the row on the timeline to add a volume point, drag points up and down, right-click one to remove it. The razor (C) cuts the row into pieces with their own volume.'));
+      if (pts.length) { const r = h('div', 'fx-prow'); const c = h('button', 'btn sm ghost', `Clear ${pts.length} volume point${pts.length > 1 ? 's' : ''}`); c.onclick = () => { delete F.fx.vpts[g.key]; changed(); ctx.gainsChanged(); }; r.append(c); box.append(r); }
+    }
+    else if (l && isPiece(l)) {
+      const c = cutOf(l.ckey), sp = span(l);
+      title = 'Audio';
+      volumeRows(box, l.vol ?? 1, !!l.mute, v => { l.vol = v; if (v > 0) l.mute = false; ctx.gainsChanged(); }, () => { l.mute = !l.mute; ctx.gainsChanged(); changed(); });
+      box.append(h('div', 'fx-hint', `Part of ${rowName(l.ckey)}, ${fmt(sp.start)} to ${fmt(sp.end)}. ` + (c.free
+        ? 'Unlinked: drag it to slide it in time, drag its ends to shorten it.'
+        : 'Linked to the video: drag its ends to shorten it, or unlink it to slide it.') + " Delete leaves silence there. The row's volume and volume points still apply."));
+      const r = h('div', 'fx-prow');
+      const lk = h('button', 'btn sm ghost', c.free ? 'Link to Video' : 'Unlink from Video');
+      lk.onclick = () => setLinked(l.ckey, c.free);
+      const rs = h('button', 'btn sm ghost', 'Restore Whole Row');
+      rs.title = `Undo every cut on ${rowName(l.ckey)}`;
+      rs.onclick = () => restoreRow(l.ckey);
+      r.append(lk, rs, iconBtn('trash', 'Delete (Del)', () => remove(l.id)));
+      box.append(r);
+    }
     else if (l && !isSound(l)) {
       title = NAMES[l.type];
       if (l.type === 'text') textProps(box, l);
@@ -1279,7 +1546,7 @@ export function createFx(ctx) {
     } else if (l && isSound(l)) {
       title = 'Audio';
       box.append(h('div', 'fx-hint', `${l.name}. Drag it to move it or onto another track, drag its ends to choose the part that plays. Double-click it to add a volume point, drag points up and down, right-click one to remove it.`));
-      rangeRow(box, 'Volume', l.vol * 100, 0, 200, v => { l.vol = v / 100; ctx.gainsChanged(); }, '%');
+      volumeRows(box, l.vol, !!l.mute, v => { l.vol = v; if (v > 0) l.mute = false; ctx.gainsChanged(); }, () => { l.mute = !l.mute; ctx.gainsChanged(); ctx.audioChanged(); changed(); });
       const r = h('div', 'fx-prow'); r.append(iconBtn('trash', 'Delete (Del)', () => remove(l.id))); box.append(r);
     }
     // the clip itself (or nothing) selected: its crop and fades; the side panel shows its trim and
@@ -1290,7 +1557,7 @@ export function createFx(ctx) {
   }
   function generalProps(box) {
     const o = out(), r = h('div', 'fx-prow');
-    r.append(h('span', 'fx-plabel', 'Crop'), h('span', 'fx-pval wide', F.fx.crop ? `${o.w} x ${o.h}` : 'None'), iconBtn(F.fx.crop ? 'edit' : 'crop', F.fx.crop ? 'Change the crop' : 'Crop the clip (C)', startCrop));
+    r.append(h('span', 'fx-plabel', 'Crop'), h('span', 'fx-pval wide', F.fx.crop ? `${o.w} x ${o.h}` : 'None'), iconBtn(F.fx.crop ? 'edit' : 'crop', F.fx.crop ? 'Change the crop' : 'Crop the clip', startCrop));
     if (F.fx.crop) r.append(iconBtn('trash', 'Remove the crop', () => { F.fx.crop = null; changed(); }));
     box.append(r);
     const f = h('div', 'fx-prow');
@@ -1352,11 +1619,55 @@ export function createFx(ctx) {
     colorRow(box, l.color, c => { l.color = c; });
     if (!l.fill || l.shape === 'line' || l.shape === 'arrow') rangeRow(box, 'Thickness', l.stroke * 1000, 2, 40, v => { l.stroke = v / 1000; });
   }
+  // which stage of a zoom the playhead is on: -1 = its own box, else the step's index
+  function stageAt(z, t = Q.t) {
+    let k = -1;
+    (z.steps || []).forEach((st, i) => { if (t >= st.t && st.t > z.start && st.t < z.end) k = i; });
+    return k;
+  }
+  // what the box on the video edits for a zoom: the stage under the playhead
+  const zoomTarget = z => { const k = stageAt(z); return k < 0 ? z : z.steps[k]; };
+  // for dragging: a step looks like a zoom (a square box kept inside the frame) to dragMove
+  function zoomEditTarget(z) {
+    const st = zoomTarget(z);
+    if (st === z) return z;
+    return { type: 'zoom', get box() { return st.box; }, set box(v) { st.box = v; } };
+  }
+  function addZoomStep(z) {
+    const t = Q.t;
+    if (t <= z.start + 0.1 || t >= z.end - 0.1) { ctx.status('Move the playhead inside the zoom to add a step there.', null, 4000); return; }
+    if ((z.steps || []).some(st => Math.abs(st.t - t) < 0.1)) { ctx.status('There is a step there already.', null, 3000); return; }
+    // the new step zooms in further on the same spot: three quarters of what's showing, same middle
+    const b = zoomBoxAt(z, t), w = clamp(b.w * 0.75, 0.05, 1), cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+    const st = { t: r4(t), ease: 0.4, box: keepInside({ x: cx - w / 2, y: cy - w / 2, w, h: w }) };
+    z.steps = [...(z.steps || []), st].sort((a, b2) => a.t - b2.t);
+    ctx.seekTo(Math.min(z.end - 0.01, t + st.ease));
+    changed();
+  }
   function zoomProps(box, l) {
     box.append(h('div', 'fx-hint', 'Drag the box on the video to choose what to zoom into. On its track, the lighter ends of the block are the zoom in and out: drag them for a slower zoom, or all the way to the edge for a straight cut.'));
     const s = v => (v / 10).toFixed(1) + 's';
     rangeRow(box, 'Zoom in', l.ein * 10, 0, 20, v => { l.ein = Math.min(v / 10, (l.end - l.start) / 2); }, '', s);
     rangeRow(box, 'Zoom out', l.eout * 10, 0, 20, v => { l.eout = Math.min(v / 10, (l.end - l.start) / 2); }, '', s);
+    // steps: the stage under the playhead is the one the box on the video changes
+    const cur = stageAt(l), list = h('div', 'fx-zsteps');
+    const stageRow = (i, label, t) => {
+      const r = h('div', 'fx-zstep' + (cur === i ? ' on' : ''));
+      const go = h('button', 'fx-zgo', label);
+      go.title = 'Show this stage (the box on the video then changes it)';
+      go.onclick = () => { ctx.seekTo(i < 0 ? Math.min(l.end - 0.01, l.start + l.ein + 0.01) : Math.min(l.end - 0.01, l.steps[i].t + l.steps[i].ease)); bump(); renderAll(); };
+      r.append(go, h('span', 'fx-pval', `${Math.round(1 / (i < 0 ? l.box.w : l.steps[i].box.w) * 10) / 10}x  ·  ${fmt(t)}`));
+      if (i >= 0) r.append(iconBtn('trash', 'Remove this step', () => { l.steps.splice(i, 1); if (!l.steps.length) delete l.steps; changed(); }));
+      list.append(r);
+      if (i >= 0 && cur === i) rangeRow(list, 'Ease', l.steps[i].ease * 10, 0, 30, v => { l.steps[i].ease = v / 10; }, '', s);
+    };
+    stageRow(-1, 'Step 1', l.start);
+    (l.steps || []).forEach((st, i) => stageRow(i, `Step ${i + 2}`, st.t));
+    box.append(list);
+    const r = h('div', 'fx-prow'), add = h('button', 'btn sm ghost', 'Add Step at Playhead');
+    add.title = 'Zoom in further from here (then drag its box on the video)';
+    add.onclick = () => addZoomStep(l);
+    r.append(add); box.append(r);
   }
   function drawProps(box) {
     chipRow(box, 'Tool', [[false, 'Brush'], [true, 'Eraser']], F.brush.e, v => { F.brush.e = v; });
@@ -1369,14 +1680,18 @@ export function createFx(ctx) {
     r.append(tool, clr); box.append(r);
   }
   function cropProps(box) {
-    chipRow(box, 'Shape', CROPS, F.cropAspect, v => cropPreset(v));
-    const b = F.draft || F.fx.crop;
-    if (b) { const src = info(); box.append(h('div', 'fx-hint', `${even(b.w * (src.width || 0))} x ${even(b.h * (src.height || 0))}`)); }
+    chipRow(box, 'Aspect', CROPS, F.cropAspect, v => cropPreset(v));
+    const b = F.draft || F.fx.crop, src = info();
+    const r0 = h('div', 'fx-prow');
+    const lock = iconBtn(F.cropLock ? 'lock' : 'unlock', F.cropLock ? 'Shape locked: corners and sides keep it (hold Shift to change it freely)' : 'Lock the shape (or hold Shift while dragging)', () => { F.cropLock = !F.cropLock; if (!F.cropLock) F.cropAspect = 0; bump(); renderAll(); });
+    lock.classList.toggle('on', F.cropLock);
+    r0.append(h('span', 'fx-plabel', 'Lock'), lock, h('span', 'fx-pval wide', b ? `${even(b.w * (src.width || 0))} x ${even(b.h * (src.height || 0))}` : `${src.width || 0} x ${src.height || 0} (no crop)`));
+    box.append(r0);
     const r = h('div', 'fx-prow');
     const done = h('button', 'btn sm primary', 'Done'); done.onclick = endCrop;
-    const reset = h('button', 'btn sm ghost', 'Reset'); reset.onclick = () => { F.fx.crop = null; F.cropAspect = 0; changed(); };
+    const reset = h('button', 'btn sm ghost', 'Reset'); reset.onclick = () => { F.fx.crop = null; F.cropAspect = 0; F.cropLock = false; changed(); };
     r.append(done, reset); box.append(r);
-    box.append(h('div', 'fx-hint', 'Drag on the video to draw the crop, or drag its corners. The export comes out at this shape.'));
+    box.append(h('div', 'fx-hint', 'Drag on the video to draw the crop, drag any side or corner to resize it, drag inside it to move it. Shift while dragging switches the lock. The export comes out at this shape.'));
   }
   function timeRow(box, l) {
     const r = h('div', 'fx-prow fx-times');
@@ -1397,11 +1712,6 @@ export function createFx(ctx) {
   }
   function iconBtn(ic, title, run) { const b = h('button', 'ibtn sm'); b.title = title; b.append(icoSpan(ic)); b.onclick = run; return b; }
   function renderTools() {
-    const l = selected();
-    for (const b of document.querySelectorAll('#qttools [data-tool]')) {
-      const t = b.dataset.tool;
-      b.classList.toggle('on', F.tool === t || (!F.tool && !!l && !isSound(l) && l.type === t && t !== 'crop'));
-    }
     $('qtundo').disabled = !ctx.canUndo(); $('qtredo').disabled = !ctx.canRedo();
     $('etlselect').classList.toggle('on', F.mode === 'select');
     $('etlrazor').classList.toggle('on', F.mode === 'razor');
@@ -1411,6 +1721,7 @@ export function createFx(ctx) {
     edit.dataset.key = ''; F.drawKey = '';
     renderTracks(); renderProps(); renderTools(); renderAssets();
     $('qtstage').classList.toggle('cropping', F.tool === 'crop');
+    if (F.tool !== 'draw') brushEl.hidden = true;
   }
 
   // ---------- toolbar and keys ----------
@@ -1418,8 +1729,8 @@ export function createFx(ctx) {
     crop: () => (F.tool === 'crop' ? endCrop() : startCrop()), zoom: addZoom, text: addText, image: () => pick('image'), shape: () => addShape(),
     blur: addBlur, draw: () => { if (F.tool === 'draw') { F.tool = null; bump(); renderAll(); } else startDraw(); }, audio: () => pick('audio'),
   };
-  for (const b of document.querySelectorAll('#qttools [data-tool]')) b.onclick = () => { if (Q.dur && !Q.exporting) tools[b.dataset.tool](); };
-  const KEYS = { c: 'crop', z: 'zoom', t: 'text', g: 'image', s: 'shape', b: 'blur', d: 'draw', a: 'audio' };
+  // (the Effects tab's tools have no keys for now: C is the razor, as in Premiere)
+  const KEYS = { t: 'text', g: 'image', s: 'shape', a: 'audio' };
   // plain keys (Edit only); returns true when handled
   function onKey(e, k) {
     if (!F.on) return false;
@@ -1433,7 +1744,7 @@ export function createFx(ctx) {
     if ((k === 'delete' || k === 'backspace') && selected()) { remove(F.sel); return true; }
     if (e.ctrlKey || e.metaKey || e.altKey) return false;
     if (k === 'v') { setMode('select'); return true; }
-    if (k === 'r') { setMode(F.mode === 'razor' ? 'select' : 'razor'); return true; }
+    if (k === 'c') { setMode(F.mode === 'razor' ? 'select' : 'razor'); return true; }
     if (KEYS[k] && Q.dur && !Q.exporting) { tools[KEYS[k]](); return true; }
     return false;
   }
@@ -1443,6 +1754,8 @@ export function createFx(ctx) {
     if (k === 'c' && selected()) { copyBlock(F.sel); return true; }
     if (k === 'd' && selected()) { duplicate(F.sel); return true; }
     if (k === 'k' && selected()) { split(F.sel); return true; }
+    if (k === 'k' && selRow()) { if (!razorRows([selRow().key], Q.t)) ctx.status('Move the playhead inside the sound to cut it.', null, 4000); return true; }
+    if (k === 'k' && Q.groups.length) { if (!razorRows(Q.groups.map(g => g.key), Q.t)) ctx.status('Move the playhead inside the sound to cut it.', null, 4000); return true; }
     if (k === 'v' && F.clipboard) return paste();
     return false;
   }
@@ -1461,7 +1774,7 @@ export function createFx(ctx) {
 
   return {
     load, state, rasterize, frame, layout, onKey, onCtrl, dropFile, remove, select, renderAll, renderTools, renderTracks, allPts, hasVisual,
-    sounds: () => F.fx.sounds, fades: () => F.fx.fades, aMuted, selectedId: () => F.sel, setOn, fitView, useAsset, tab: () => (F.panelOff ? null : F.tab), pickTab,
+    sounds: () => F.fx.sounds, cuts: () => F.fx.cuts, fades: () => F.fx.fades, aMuted, selectedId: () => F.sel, setOn, fitView, useAsset, tab: () => (F.panelOff ? null : F.tab), pickTab,
     hasContent: () => hasContent(F.fx), view: () => ({ ...F.v }), setView: (a, b) => setView(a, b),
     setState(fx) { load(fx); ctx.changed(); }, // tests
     thumbCount: () => TH.frames.size, // tests
