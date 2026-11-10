@@ -1166,6 +1166,7 @@ function layoutGrid() {
 function paintGrid() {
   const box = $('libgrid'), sc = $('libscroll');
   if (!V.rows.length) return;
+  silenceOnScreen();
   const top = box.getBoundingClientRect().top - sc.getBoundingClientRect().top; // the grid's top, on screen
   const y0 = -top - V_OVER, y1 = -top + sc.clientHeight + V_OVER;
   const want = new Set(), heads = new Set();
@@ -1257,6 +1258,25 @@ function backgroundThumbs() {
   setTimeout(next, 600); // after the first screen has had its turn
 }
 
+// Encore cards on screen once scrolling stops: main works out their silent tracks ahead of time, so
+// the editor opens with them already folded (only what's looked at, not the whole library)
+let silenceTimer = null;
+function silenceOnScreen() {
+  clearTimeout(silenceTimer);
+  silenceTimer = setTimeout(() => {
+    if ($('libgrid').classList.contains('scrolling') || $('library').classList.contains('away')) return;
+    const r = $('libscroll').getBoundingClientRect();
+    const paths = [...document.querySelectorAll('#libgrid .clip')].filter(el => {
+      const b = el.getBoundingClientRect(), c = el._clip;
+      return c && c.origin === 'encore' && c.kind !== 'export' && c.size > 0 && b.bottom > r.top && b.top < r.bottom;
+    }).map(el => el._clip.path);
+    if (paths.length) T.silencePrefetch(paths);
+  }, 300);
+}
+
+// the Encore card under the mouse is checked first: it's the likeliest to be opened next
+const silenceFirst = c => { if (c && c.origin === 'encore' && c.kind !== 'export' && c.size > 0) T.silenceFirst(c.path); };
+
 // scrolling: no hover effects or previews on the cards sliding under the mouse - they made it stutter
 let scrollIdle = null;
 $('libscroll').addEventListener('scroll', () => {
@@ -1268,6 +1288,7 @@ $('libscroll').addEventListener('scroll', () => {
   clearTimeout(scrollIdle);
   scrollIdle = setTimeout(() => {
     g.classList.remove('scrolling');
+    silenceOnScreen();
     // the card that ended up under the mouse gets its preview, same as hovering it
     const el = document.elementFromPoint(mouseAt.x, mouseAt.y);
     const cardEl = el && el.closest && el.closest('#libgrid .clip');
@@ -1343,7 +1364,7 @@ function card(c, wave) {
   };
   el.addEventListener('keydown', e => { if (e.key === 'Enter') openClip(el._clip, el); });
   el.addEventListener('contextmenu', e => { e.preventDefault(); showMenu(e.clientX, e.clientY, el._clip, el); });
-  el.addEventListener('mouseenter', () => { schedulePreview(el, el._clip); readyDrag(el._clip, 250); });
+  el.addEventListener('mouseenter', () => { schedulePreview(el, el._clip); readyDrag(el._clip, 250); silenceFirst(el._clip); });
   el.addEventListener('mouseleave', () => { if (preview.el === el && !preview.dragging) stopPreview(); clearTimeout(preview.timer); clearTimeout(dragTimer); });
   el.addEventListener('pointerdown', e => { if (e.button === 0) readyDrag(el._clip, 0); });
   el.addEventListener('dragstart', e => dragOut(e, el._clip));
@@ -1356,7 +1377,7 @@ function refreshCard(el, c) {
   el.querySelector('.ctitle').textContent = clipTitle(c);
   el.querySelector('.ctitle').title = c.name;
   // an edited clip shows the size it will have when dragged, copied or exported
-  const tr = trimOf(c), sz = tr ? '≈ ' + fmtSize(estSize(c.size, tr.b - tr.a, c.duration || (c.edit && c.edit.dur))) : fmtSize(c.size);
+  const tr = trimOf(c), sz = tr ? '≈ ' + fmtSize(estSize(c.size, tr.len, c.duration || (c.edit && c.edit.dur))) : fmtSize(c.size);
   const sub = [L.game === 'all' ? c.gameName : '', c.sub, sz].filter(Boolean).join('  ·  ');
   el.querySelector('.csub').textContent = sub;
   el.querySelector('.cfile').textContent = c.name;
@@ -1438,7 +1459,7 @@ function dragPicture(c, card) {
     }
     const lh = 15 * S, metaY = H - pad;
     // under the name: the length (or trimmed length), and the game when there's room
-    const t = trimOf(c), len = (t ? '✂ ' : '') + fmtLen(t ? t.b - t.a : c.duration || 0);
+    const t = trimOf(c), len = (t ? '✂ ' : '') + fmtLen(t ? t.len : c.duration || 0);
     g.font = `500 ${10.5 * S}px Inter, "Segoe UI", sans-serif`; g.fillStyle = 'rgba(255,255,255,.75)';
     const withGame = c.gameName ? len + '  ·  ' + c.gameName : len;
     g.fillText(g.measureText(withGame).width <= maxW ? withGame : c.gameName ? fit(withGame, maxW) : len, pad, metaY);
@@ -1452,17 +1473,22 @@ function dragPicture(c, card) {
 
 // ---------- saved trims on cards ----------
 // the part of the clip that's kept (whole clip when it hasn't been trimmed)
+// a clip's trim and speed (Trim's Speed row); len = how long the file it makes plays
+// the trim and how long the file it makes plays (the trim's speed and Edit's speed parts: TimeMap)
 const trimOf = c => {
-  const e = c.edit, d = c.duration || (e && e.dur) || 0;
-  if (!e || !d || (e.in <= 0.01 && e.out >= d - 0.01)) return null;
-  return { a: Math.max(0, e.in), b: Math.min(d, e.out) };
+  const e = c.edit, d = c.duration || (e && e.dur) || 0, s = e && [0.25, 0.5, 1.5, 2, 4].includes(+e.speed) ? +e.speed : 1;
+  const sp = e && e.fx && Array.isArray(e.fx.layers) ? e.fx.layers.filter(l => l && l.type === 'speed') : [];
+  if (!e || !d || (e.in <= 0.01 && e.out >= d - 0.01 && s === 1 && !sp.length)) return null;
+  const a = Math.max(0, e.in || 0), b = Math.min(d, e.out || d);
+  const m = TimeMap.build(sp, s, d);
+  return { a, b, s, len: m.toOut(b) - m.toOut(a), parts: sp.length };
 };
 const showLength = (el, c) => setLength(el.querySelector('.cdur'), c);
 function setLength(d, c) {
   if (!d) return;
   const t = trimOf(c);
   d.replaceChildren();
-  if (t) { d.append(icoSpan('scissors'), document.createTextNode(fmtLen(t.b - t.a))); d.title = `Trimmed from ${fmtLen(c.duration)}`; }
+  if (t) { d.append(icoSpan('scissors'), document.createTextNode(fmtLen(t.len))); d.title = `Trimmed from ${fmtLen(c.duration)}` + (t.s !== 1 ? `, at ${t.s}× speed` : '') + (t.parts ? `, with ${t.parts} speed part${t.parts > 1 ? 's' : ''}` : ''); }
   else { d.textContent = c.duration ? fmtLen(c.duration) : ''; d.removeAttribute('title'); }
 }
 // the editor changed a clip (trim, name): update its cards and the library's copy of it
@@ -1546,6 +1572,7 @@ function paintCard(el, r) {
 // one at a time: load the clip in a hidden player, grab a frame about a third in, save it
 let playerQueue = Promise.resolve();
 function playerThumb(c) {
+  if (!c.size) return Promise.resolve(null); // an empty file (a recorder claiming the name): nothing to load
   const job = playerQueue.then(() => new Promise(resolve => {
     const vid = document.createElement('video');
     vid.muted = true; vid.preload = 'auto';
@@ -1583,6 +1610,7 @@ function schedulePreview(el, c) {
 function startPreview(el, c) {
   stopPreview();
   if (!el.isConnected || $('library').classList.contains('away')) return;
+  if (!c.size) return; // an empty file (a recorder claiming the name) has nothing to play
   const vid = h('video');
   vid.muted = true; vid.playsInline = true; vid.loop = true; vid.preload = 'auto';
   // Big clips are read from the drive as they play; the first time, the first frame shows up
@@ -1592,6 +1620,7 @@ function startPreview(el, c) {
   vid.addEventListener('loadedmetadata', () => {
     if (preview.dragging) return; // the seek bar is being held; it decides where to start
     vid.currentTime = trimOf(c) ? trimOf(c).a : 0; // every hover starts from the beginning (of the trim)
+    vid.playbackRate = trimOf(c) ? trimOf(c).s : 1; // and plays at the clip's speed
   }, { once: true });
   let started = false;
   const go = () => {

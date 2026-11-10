@@ -9,6 +9,7 @@ const S = 'fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="ro
 const skip = (dir, n) => `<svg viewBox="0 0 24 24"><path ${S} d="${dir < 0 ? 'M4.5 12a7.5 7.5 0 1 0 2.2-5.3M4.5 4v4h4' : 'M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.5 4v4h-4'}"/><text x="${dir < 0 ? 12.3 : 11.7}" y="15.1" font-size="${n > 9 ? 6.6 : 7.5}" font-weight="700" text-anchor="middle" fill="currentColor" font-family="Segoe UI,sans-serif">${n}</text></svg>`;
 const ICONS = {
   crop: `<svg viewBox="0 0 24 24"><path ${S} d="M6 2.5V16a2 2 0 0 0 2 2h13.5M2.5 6H16a2 2 0 0 1 2 2v13.5"/></svg>`,
+  speed: `<svg viewBox="0 0 24 24"><path ${S} d="M4.6 17.5a8.5 8.5 0 1 1 14.8 0"/><path ${S} d="M12 14.5l4.2-5.2"/><circle cx="12" cy="14.5" r="1.6" fill="currentColor"/></svg>`,
   zoom: `<svg viewBox="0 0 24 24"><circle ${S} cx="10.5" cy="10.5" r="6.5"/><path ${S} d="M20.5 20.5l-5.3-5.3M10.5 8v5M8 10.5h5"/></svg>`,
   text: `<svg viewBox="0 0 24 24"><path ${S} d="M5 7V4.5h14V7M12 4.5v15M9 19.5h6"/></svg>`,
   image: `<svg viewBox="0 0 24 24"><rect ${S} x="3.5" y="4.5" width="17" height="15" rx="2"/><circle ${S} cx="9" cy="10" r="1.6"/><path ${S} d="M20.5 15.5l-5-5-9.5 9"/></svg>`,

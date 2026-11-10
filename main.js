@@ -13,6 +13,8 @@ try {
 if (!FFMPEG || !fs.existsSync(FFMPEG)) FFMPEG = 'ffmpeg';
 if (process.env.BACKSTAGE_FFMPEG) FFMPEG = process.env.BACKSTAGE_FFMPEG; // tests: the Linux build can't read MPEG-TS
 const smartcut = require('./smartcut.js');
+const { provenSilent } = require('./silence.js');
+const TimeMap = require('./renderer/timemap.js');
 
 const VIDEO_EXT = ['mp4', 'mkv', 'mov', 'webm', 'avi', 'flv', 'ts', 'm4v'];
 
@@ -494,10 +496,17 @@ const box01 = b => ({ x: num(b && b.x, 0, 1, 0), y: num(b && b.y, 0, 1, 0), w: n
 const OVERLAYS = ['text', 'image', 'draw', 'shape'];
 function cleanFx(fx) {
   if (!fx || typeof fx !== 'object') return null;
-  const out = { crop: null, layers: [], sounds: [], vpts: {}, fades: {}, cuts: {} };
+  const out = { crop: null, layers: [], sounds: [], vpts: {}, fades: {}, cuts: {}, speeds: [] };
   if (fx.crop) { const c = box01(fx.crop); if (c.w < 0.999 || c.h < 0.999) out.crop = c; }
   const vtracks = Array.isArray(fx.vtracks) ? fx.vtracks : [], atracks = Array.isArray(fx.atracks) ? fx.atracks : [];
   for (const l of Array.isArray(fx.layers) ? fx.layers : []) {
+    // speed parts (clip time, on V1): the timeline's own time, worked out by TimeMap
+    if (l && l.type === 'speed') {
+      if (TimeMap.RATES.includes(+l.rate) && num(l.end, 0, 1e6) > num(l.start, 0, 1e6) + 0.01) {
+        out.speeds.push({ type: 'speed', start: num(l.start, 0, 1e6), end: num(l.end, 0, 1e6), rate: +l.rate, mute: !!l.mute, ease: l.ease !== false });
+      }
+      continue;
+    }
     if (!l || l.hidden || !['zoom', 'blur', ...OVERLAYS].includes(l.type)) continue;
     if (l.type !== 'zoom' && vtracks[l.track | 0] && vtracks[l.track | 0].hidden) continue; // zooms are on V1, which can't be hidden
     const L = { type: l.type, track: num(l.track, 0, 99, 0) | 0, start: num(l.start, 0, 1e6), end: num(l.end, 0, 1e6) };
@@ -540,7 +549,7 @@ function cleanFx(fx) {
   }
   const f = fx.fades || {};
   for (const k of ['vin', 'vout', 'ain', 'aout']) if (num(f[k], 0, 10, 0) > 0) out.fades[k] = num(f[k], 0, 10, 0);
-  return out.crop || out.layers.length || out.sounds.length || Object.keys(out.vpts).length || Object.keys(out.fades).length || Object.keys(out.cuts).length ? out : null;
+  return out.crop || out.layers.length || out.sounds.length || out.speeds.length || Object.keys(out.vpts).length || Object.keys(out.fades).length || Object.keys(out.cuts).length ? out : null;
 }
 const f4 = n => String(Math.round(n * 10000) / 10000);
 // a volume curve through the points (straight lines between them), on the export's own clock
@@ -578,10 +587,19 @@ function zoomExpr(zooms, off) {
   return { z: `1/(1-(${sum(b => `1-${b.w}`)}))`, x: `(${sum(b => b.x)})*iw`, y: `(${sum(b => b.y)})*ih` };
 }
 const even = n => Math.max(2, Math.floor(n / 2) * 2);
-async function fxMake({ src, info, start, length, list, fx, target, out, progress, job, audioOnly, mark = ['-movflags', '+faststart'] }) {
-  fx = fx || { crop: null, layers: [], sounds: [], vpts: {}, fades: {}, cuts: {} };
+async function fxMake({ src, info, start, length, list, fx, target, out, progress, job, audioOnly, mark = ['-movflags', '+faststart'], speed = 1 }) {
+  fx = fx || { crop: null, layers: [], sounds: [], vpts: {}, fades: {}, cuts: {}, speeds: [] };
   const cuts = fx.cuts || {};
   const end = start + length, W = info.width || 1920, H = info.height || 1080, fps = info.fps || 30;
+  // The timeline's time (speed parts and the trim's speed): the clip's picture and sound are retimed to
+  // it; text, pictures, blur and added sounds are placed on it (O0 = where the trim starts on it).
+  const map = TimeMap.build(fx.speeds || [], speed, Math.max(end, info.duration || 0));
+  const O0 = map.toOut(start), outLen = map.toOut(end) - O0;
+  const segs = [];
+  for (const g of map.between(start, end)) {
+    const last = segs[segs.length - 1];
+    if (last && last.rate === g.rate && last.mute === g.mute) last.c1 = g.c1; else segs.push({ ...g });
+  }
   let cw = even(W), ch = even(H), cx = 0, cy = 0;
   if (fx.crop) {
     cw = even(fx.crop.w * W); ch = even(fx.crop.h * H);
@@ -592,13 +610,13 @@ async function fxMake({ src, info, start, length, list, fx, target, out, progres
   const parts = [];
   let n = 0, cur = '[0:v]';
   const next = () => `[v${n++}]`;
-  const seen = l => l.end > start && l.start < end;
-  const en = l => `between(t,${f4(Math.max(0, l.start - start))},${f4(l.end - start)})`;
+  const seen = l => l.end > O0 && l.start < O0 + outLen; // on the timeline
+  const en = l => `between(t,${f4(Math.max(0, l.start - O0))},${f4(l.end - O0)})`;
   // target size: the bitrate that fits, and a smaller picture when that's too few bits for it
   let vk = Math.round(Math.max(2000, sourceKbps(info) * (cw * ch) / (W * H))), ow = cw, oh = ch, ofps = fps;
   const hasAudio = list.length || fx.sounds.length;
   if (target && !audioOnly) {
-    vk = Math.floor(target * 8 / 1000 / length * 0.93 - (hasAudio ? 160 : 0));
+    vk = Math.floor(target * 8 / 1000 / outLen * 0.93 - (hasAudio ? 160 : 0));
     if (vk < 150) throw new Error(`It's too long to fit in ${Math.round(target / 1048576)} MB. Trim it shorter first.`);
     const bpp = () => vk * 1000 / (ow * oh * ofps);
     for (const hh of [1080, 720, 480]) if (bpp() < 0.05 && oh > hh) { ow = even(cw * hh / ch); oh = hh; }
@@ -607,10 +625,21 @@ async function fxMake({ src, info, start, length, list, fx, target, out, progres
   }
   if (!audioOnly) {
     if (fx.crop) { const o = next(); parts.push(`${cur}crop=${cw}:${ch}:${cx}:${cy}${o}`); cur = o; }
-    const zooms = fx.layers.filter(l => l.type === 'zoom' && seen(l));
+    const zooms = fx.layers.filter(l => l.type === 'zoom' && l.end > start && l.start < end); // clip time
     if (zooms.length) {
       const z = zoomExpr(zooms, start), o = next();
       parts.push(`${cur}zoompan=z='${z.z}':x='${z.x}':y='${z.y}':d=1:s=${cw}x${ch}:fps=${f4(fps)}${o}`); cur = o;
+    }
+    // the frames move to their time on the timeline (repeated when slower, skipped when faster)
+    if (!map.identity) {
+      const X = '(T-STARTT)';
+      let e = null;
+      for (let i = segs.length - 1; i >= 0; i--) {
+        const g = segs[i], f = `(${f4(g.o0 - O0)}+(${X}-${f4(g.c0 - start)})/${f4(g.rate)})`;
+        e = e === null ? f : `if(lt(${X},${f4(g.c1 - start)}),${f},${e})`;
+      }
+      const o = next();
+      parts.push(`${cur}setpts='(${e})/TB',fps=${f4(ofps)}${o}`); cur = o;
     }
     // blur boxes and drawn layers, bottom track first: a blur blurs everything under it
     for (const l of fx.layers.filter(x => x.type !== 'zoom' && seen(x))) {
@@ -628,13 +657,14 @@ async function fxMake({ src, info, start, length, list, fx, target, out, progres
     }
     const post = [];
     if (ow !== cw || oh !== ch) post.push(`scale=${ow}:${oh}:flags=lanczos`);
-    if (ofps !== fps) post.push(`fps=${ofps}`);
-    if (fx.fades.vin) post.push(`fade=t=in:st=0:d=${f4(Math.min(fx.fades.vin, length / 2))}`);
-    if (fx.fades.vout) post.push(`fade=t=out:st=${f4(Math.max(0, length - fx.fades.vout))}:d=${f4(Math.min(fx.fades.vout, length / 2))}`);
+    if (ofps !== fps && map.identity) post.push(`fps=${ofps}`);
+    if (fx.fades.vin) post.push(`fade=t=in:st=0:d=${f4(Math.min(fx.fades.vin, outLen / 2))}`);
+    if (fx.fades.vout) post.push(`fade=t=out:st=${f4(Math.max(0, outLen - fx.fades.vout))}:d=${f4(Math.min(fx.fades.vout, outLen / 2))}`);
     post.push('format=yuv420p');
     parts.push(`${cur}${post.join(',')}[vout]`);
   }
-  // sound: the clip's tracks (each with its volume and points) and the added sounds, mixed
+  // sound: the clip's tracks (each with its volume and points, retimed with the picture) and the added
+  // sounds (on the timeline), mixed
   const labels = [];
   list.forEach((s, i) => {
     const c = curveExpr(fx.vpts[s.key], start);
@@ -652,20 +682,34 @@ async function fxMake({ src, info, start, length, list, fx, target, out, progres
       labels.push(`[a${i}p${j}]`);
     });
   });
+  // another speed somewhere: the clip's sound, mixed, is cut where the speed changes; each part plays at
+  // its speed with its pitch kept (atempo), a muted part is silent, and the parts join up again
+  if (!map.identity && labels.length) {
+    const mixed = labels.length > 1 ? `amix=inputs=${labels.length}:duration=longest:normalize=0,` : '';
+    const n = segs.length, outs = segs.map((_, j) => `[cs${j}]`);
+    parts.push(`${labels.join('')}${mixed}apad=whole_dur=${f4(length)}${n > 1 ? `,asplit=${n}${outs.join('')}` : outs[0]}`);
+    segs.forEach((g, j) => {
+      const tempo = atempo(g.rate);
+      parts.push(`${outs[j]}atrim=start=${f4(g.c0 - start)}:end=${f4(g.c1 - start)},asetpts=PTS-STARTPTS${g.mute ? ',volume=0' : ''}${tempo.length ? ',' + tempo.join(',') : ''}[ct${j}]`);
+    });
+    parts.push(`${segs.map((_, j) => `[ct${j}]`).join('')}${n > 1 ? `concat=n=${n}:v=0:a=1` : 'anull'}[ctime]`);
+    labels.length = 0;
+    labels.push('[ctime]');
+  }
   fx.sounds.forEach((s, i) => {
-    const from = Math.max(start, s.at), to = Math.min(end, s.at + (s.to - s.from));
+    const from = Math.max(O0, s.at), to = Math.min(O0 + outLen, s.at + (s.to - s.from));
     if (to <= from + 0.01) return;
     inputs.push('-ss', (s.from + from - s.at).toFixed(3), '-t', (to - from).toFixed(3), '-i', s.path);
-    const c = curveExpr(fx.vpts[s.key], start);
+    const c = curveExpr(fx.vpts[s.key], O0);
     const vol = c ? `volume='${f4(s.vol)}*(${c})':eval=frame` : `volume=${f4(s.vol)}`;
-    parts.push(`[${nIn++}:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,adelay=${Math.round((from - start) * 1000)}:all=1,${vol}[s${i}]`);
+    parts.push(`[${nIn++}:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,adelay=${Math.round((from - O0) * 1000)}:all=1,${vol}[s${i}]`);
     labels.push(`[s${i}]`);
   });
   let alabel = null;
   if (labels.length) {
     const af = [];
-    if (fx.fades.ain) af.push(`afade=t=in:st=0:d=${f4(Math.min(fx.fades.ain, length / 2))}`);
-    if (fx.fades.aout) af.push(`afade=t=out:st=${f4(Math.max(0, length - fx.fades.aout))}:d=${f4(Math.min(fx.fades.aout, length / 2))}`);
+    if (fx.fades.ain) af.push(`afade=t=in:st=0:d=${f4(Math.min(fx.fades.ain, outLen / 2))}`);
+    if (fx.fades.aout) af.push(`afade=t=out:st=${f4(Math.max(0, outLen - fx.fades.aout))}:d=${f4(Math.min(fx.fades.aout, outLen / 2))}`);
     const mix = labels.length > 1 ? `amix=inputs=${labels.length}:duration=longest:normalize=0` : 'anull';
     // silence to the end (a cut or a late sound can end before the trim does); -t stops it there
     parts.push(`${labels.join('')}${[mix, 'apad', ...af].join(',')}[aout]`);
@@ -685,19 +729,19 @@ async function fxMake({ src, info, start, length, list, fx, target, out, progres
     if (!audioOnly) a.push('-map', '[vout]', ...vargs(e, k));
     if (alabel) a.push('-map', alabel, ...(audioOnly ? ['-c:a', 'libmp3lame', '-b:a', '192k'] : ['-c:a', 'aac', '-b:a', '160k']));
     else a.push('-an');
-    a.push('-t', length.toFixed(3));
+    a.push('-t', outLen.toFixed(3));
     if (!audioOnly) a.push(...mark);
     a.push(out);
     return a;
   };
-  if (audioOnly) return runFfmpeg(build(null, 0), length, progress, job);
-  let r = await runFfmpeg(build(enc, vk), length, progress, job);
-  if (!r.ok && !r.cancelled && enc.name !== 'libx264') r = await runFfmpeg(build({ name: 'libx264', args: X264 }, vk), length, progress, job);
+  if (audioOnly) return runFfmpeg(build(null, 0), outLen, progress, job);
+  let r = await runFfmpeg(build(enc, vk), outLen, progress, job);
+  if (!r.ok && !r.cancelled && enc.name !== 'libx264') r = await runFfmpeg(build({ name: 'libx264', args: X264 }, vk), outLen, progress, job);
   // a little over the size: once more with less
   if (r.ok && target) {
     try {
       if (fs.statSync(out).size > target) {
-        r = await runFfmpeg(build(enc, Math.floor(vk * 0.85)), length, progress, job);
+        r = await runFfmpeg(build(enc, Math.floor(vk * 0.85)), outLen, progress, job);
         if (r.ok && fs.statSync(out).size > target) r = { ok: false, err: [`It came out over ${Math.round(target / 1048576)} MB. Try a shorter trim.`] };
       }
     } catch (e) { /* keep r */ }
@@ -723,9 +767,9 @@ async function markFor(src, what) {
   } catch (err) { args.push('-metadata', `backstage=${what}`); }
   return args;
 }
-async function makeFile({ src, info, start, length, audioOnly, list, out, progress, job, keepTracks, fx, target, mark }) {
+async function makeFile({ src, info, start, length, audioOnly, list, out, progress, job, keepTracks, fx, target, mark, speed = 1 }) {
   mark = audioOnly ? [] : mark || ['-movflags', '+faststart'];
-  if (!keepTracks && (fx || target)) return fxMake({ src, info, start, length, list, fx, target, out, progress, job, audioOnly, mark });
+  if (!keepTracks && (fx || target || speed !== 1)) return fxMake({ src, info, start, length, list, fx, target, out, progress, job, audioOnly, mark, speed });
   if (audioOnly) return runFfmpeg(audioArgs({ src, info, start, length, list, audioOnly, out }), length, progress, job);
   const end = start + length;
   const enc = await pickEncoder();
@@ -801,7 +845,7 @@ async function looksRight(file, length, head) {
 // takes well under a second, so only the last few are kept.
 const prepared = new Map(); // key -> { out, ready: Promise<result>, job, at }
 const KEEP_PREPARED = 20;
-const exportKey = o => JSON.stringify([editKey(o.path), Math.round(o.start * 1000), Math.round(o.end * 1000), o.sources || [], o.title || '', o.fx || null]);
+const exportKey = o => JSON.stringify([editKey(o.path), Math.round(o.start * 1000), Math.round(o.end * 1000), o.sources || [], o.title || '', o.fx || null, o.speed || 1]);
 function dropPrepared(forPath) {
   for (const [k, e] of prepared) {
     if (forPath && JSON.parse(k)[0] !== editKey(forPath)) continue;
@@ -826,6 +870,7 @@ async function savedJob(src, o = {}) {
   const end = Math.min(Number(o.end ?? (e && e.out) ?? info.duration), info.duration || Infinity);
   const audio = o.audio !== undefined ? o.audio : (e && e.audio) || {};
   const fx = cleanFx(o.fx !== undefined ? o.fx : e && e.fx);
+  const speed = cleanSpeed(o.speed !== undefined ? o.speed : e && e.speed);
   const groups = audioGroups(info);
   let sources;
   // volume points on the clip's own rows: every row is mixed on its own so each can follow its curve
@@ -837,17 +882,29 @@ async function savedJob(src, o = {}) {
   const title = await titleOf(src);
   const whole = start <= 0.01 && end >= info.duration - 0.01;
   const plainAudio = Object.values(audio).every(a => !a.mute && Math.abs((+a.vol || 1) - 1) < 0.001);
-  return { info, start, end, sources, title, fx, untouched: whole && plainAudio && !fx };
+  return { info, start, end, sources, title, fx, speed, untouched: whole && plainAudio && !fx && speed === 1 };
+}
+// the whole trim's speed (Trim's Speed row): 0.25x to 4x, 1 when unset
+const SPEEDS = [0.25, 0.5, 1, 1.5, 2, 4];
+const cleanSpeed = v => (SPEEDS.includes(+v) ? +v : 1);
+// ffmpeg's atempo keeps the pitch; each step is kept within 0.5 to 2 for the best sound
+function atempo(s) {
+  const a = [];
+  let r = s;
+  while (r < 0.5) { a.push('atempo=0.5'); r /= 0.5; }
+  while (r > 2) { a.push('atempo=2'); r /= 2; }
+  if (Math.abs(r - 1) > 0.0001) a.push(`atempo=${f4(r)}`);
+  return a;
 }
 // make (or reuse) the file for a trim; resolves to { ok, out }
 function prepare(src, j) {
-  const key = exportKey({ path: src, start: j.start, end: j.end, sources: j.sources, title: j.title, fx: j.fx });
+  const key = exportKey({ path: src, start: j.start, end: j.end, sources: j.sources, title: j.title, fx: j.fx, speed: j.speed });
   let e = prepared.get(key);
   if (e) { e.at = Date.now(); return e; }
   const dir = tempDir('prep'), out = path.join(dir, outName(src, j.title) + '.mp4');
   const job = { child: null, kids: new Set(), cancelled: false };
   e = { out, job, at: Date.now() };
-  e.ready = markFor(src, 'export').then(mark => makeFile({ src, info: j.info, start: j.start, length: j.end - j.start, audioOnly: false, list: j.sources, out, progress: null, job, fx: j.fx, mark }))
+  e.ready = markFor(src, 'export').then(mark => makeFile({ src, info: j.info, start: j.start, length: j.end - j.start, audioOnly: false, list: j.sources, out, progress: null, job, fx: j.fx, speed: j.speed, mark }))
     .then(r => { if (!r.ok) { prepared.delete(key); fs.rmSync(dir, { recursive: true, force: true }); } return { ...r, out }; });
   prepared.set(key, e);
   trimPrepared();
@@ -908,7 +965,7 @@ async function qtExport(o) {
     return { out, size: fs.statSync(out).size, seconds: Math.round((Date.now() - t0) / 100) / 10 };
   }
   const j = await savedJob(src, o);
-  const { info, start, end, sources: list, title, fx } = j;
+  const { info, start, end, sources: list, title, fx, speed } = j;
   if (!(end > start)) throw new Error('Invalid start/end.');
   const length = end - start, ext = audioOnly ? '.mp3' : '.mp4';
   if (audioOnly && !list.length && !(fx && fx.sounds.length)) throw new Error('All the audio is muted, so there is nothing to export.');
@@ -927,7 +984,7 @@ async function qtExport(o) {
 
   const progress = p => win && !win.isDestroyed() && win.webContents.send('qt-progress', p);
   state.cancelled = false;
-  const r = await makeFile({ src, info, start, length, audioOnly, list, out, progress, job: state, fx, target, mark: await markFor(src, 'export') });
+  const r = await makeFile({ src, info, start, length, audioOnly, list, out, progress, job: state, fx, speed, target, mark: await markFor(src, 'export') });
   if (r.cancelled) { fs.rmSync(out, { force: true }); return { cancelled: true }; }
   if (!r.ok) { fs.rmSync(out, { force: true }); throw new Error('Export failed: ' + r.err.join(' | ')); }
   state.outputs.add(out);
@@ -971,7 +1028,9 @@ async function qtReplace(o) {
   const ka = kept.all();
   if (ka[oldKey] && newKey !== oldKey) { ka[newKey] = ka[oldKey]; delete ka[oldKey]; kept.save(); }
   const ed = editFor(src), newDur = (await ffInfo(src)).duration || end - start;
-  setEdit(src, ed && ed.audio && Object.keys(ed.audio).length ? { in: 0, out: newDur, dur: newDur, audio: ed.audio } : null);
+  // (and the speed: Replace original only shortens the file)
+  const keepAudio = ed && ed.audio && Object.keys(ed.audio).length, keepSpeed = ed && cleanSpeed(ed.speed) !== 1;
+  setEdit(src, keepAudio || keepSpeed ? { in: 0, out: newDur, dur: newDur, audio: (ed && ed.audio) || {}, ...(keepSpeed ? { speed: cleanSpeed(ed.speed) } : {}) } : null);
   // Settings > File names: the file takes the clip's name too
   let to = src;
   if (renameFiles() && all[newKey]) { try { to = await renameFile(src, all[newKey]); } catch (e) { /* keeps its name */ } }
@@ -1712,12 +1771,163 @@ ipcMain.handle('read-range', (_e, p, start, end) => {
   return new Uint8Array(b.buffer, b.byteOffset, n);
 });
 
+// ---------- clips still being saved ----------
+// A recorder keeps its file open until it's done (ffmpeg too, through its faststart pass). On Windows,
+// opening with no sharing (libuv's UV_FS_O_EXLOCK; Node doesn't name it there) fails while anyone else
+// has the file open. Open and close at once: holding it would make the recorder's own reopen fail.
+const EXLOCK = 0x10000000;
+function openElsewhere(p) {
+  if (process.platform !== 'win32') return false;
+  try { fs.closeSync(fs.openSync(p, fs.constants.O_RDONLY | EXLOCK)); return false; } catch (e) { return e.code === 'EBUSY' || e.code === 'EPERM' || e.code === 'EACCES'; }
+}
+const RECENT = 2 * 60 * 1000; // a file this new that can't be read yet is taken to be still saving
 ipcMain.handle('qt-open', wrap(async (_e, p) => {
   if (!allowed(p) || !fs.existsSync(p)) throw new Error("That clip isn't there anymore.");
-  const info = await probeVideo(p);
+  const st = fs.statSync(p), recent = Date.now() - st.mtimeMs < RECENT;
+  // Only a file changed in the last 2 minutes can be still saving: an older one may just be open in
+  // a player. Encore claims the name with an empty file first; other recorders write straight into it.
+  // A clip the editor already has open is ours, not a recorder's.
+  if (recent && (st.size === 0 || (!qtFiles.has(editKey(p)) && openElsewhere(p)))) return { saving: true };
+  // the silence proof reads only the file's index and its audio frames: it runs alongside the probe
+  const quick = /\.(mp4|m4v|mov)$/i.test(p) ? quickSilent(p).catch(() => null) : null;
+  let info;
+  try { info = await probeVideo(p); } catch (err) { if (recent) return { saving: true }; throw err; }
   qtFiles.add(editKey(p));
-  return { info: { ...info, path: p, groups: audioGroups(info) }, edit: editFor(p), title: await titleOf(p) };
+  const groups = audioGroups(info);
+  // silent tracks come with the clip (proven in a few tens of milliseconds, or remembered), so its rows
+  // are built folded from the start; tracks the proof can't settle are decoded afterwards (unsure)
+  let silent = null, unsure = null;
+  const h = info.encore && quick ? await quick : null;
+  if (h) {
+    const idx = groups.flatMap(g => g.idx);
+    silent = idx.filter(i => h.tracks[i] === true);
+    unsure = idx.filter(i => !(String(i) in h.tracks));
+  }
+  return { info: { ...info, path: p, groups }, edit: editFor(p), title: await titleOf(p), silent, unsure };
 }));
+
+// ---------- silent tracks ----------
+// A track is silent only if every decoded sample is exactly 0: no threshold, so a single sample of sound
+// keeps it. Decoded as 32-bit float, so even the quietest sound can't round to 0. ffmpeg must decode
+// the whole track without an error, or the track counts as having sound. Remembered per file (size + date).
+const silence = jsonStore('silence.json');
+const ZEROS = Buffer.alloc(1 << 16);
+function allZero(b) {
+  for (let o = 0; o < b.length; o += ZEROS.length) {
+    const n = Math.min(ZEROS.length, b.length - o);
+    if (b.compare(ZEROS, 0, n, o, o + n) !== 0) return false;
+  }
+  return true;
+}
+function trackSilent(file, index, low) {
+  return new Promise(resolve => {
+    let sound = false, bytes = 0, settled = false;
+    const finish = v => { if (!settled) { settled = true; resolve(v); } };
+    const c = spawn(FFMPEG, ['-hide_banner', '-loglevel', 'error', '-xerror', '-i', file, '-map', `0:a:${index}`, '-vn',
+      '-c:a', 'pcm_f32le', '-f', 'f32le', '-'], { windowsHide: true });
+    if (low) { try { os.setPriority(c.pid, os.constants.priority.PRIORITY_BELOW_NORMAL); } catch (e) { /* ignore */ } }
+    c.stdout.on('data', b => {
+      if (sound) return;
+      bytes += b.length;
+      if (!allZero(b)) { sound = true; finish(false); try { c.kill(); } catch (e) { /* ignore */ } }
+    });
+    c.stderr.on('data', () => {});
+    c.on('error', () => finish(false));
+    c.on('close', code => finish(!sound && code === 0 && bytes > 0));
+  });
+}
+// The file's entry in silence.json (a new one when the file changed), shared by every check of it.
+function silenceEntry(p) {
+  const st = fs.statSync(p), stamp = `${st.size}:${Math.round(st.mtimeMs)}`, k = editKey(p), all = silence.all();
+  if (!all[k] || all[k].stamp !== stamp) all[k] = { stamp, tracks: {} };
+  return all[k];
+}
+// First the proof from the AAC frames (silence.js: a track whose every frame carries no sound data is
+// exactly silent; about 30 ms for a 2-minute clip). It only ever marks tracks silent; the rest stay
+// unknown until decoded.
+const fastJobs = new Map();
+async function quickSilent(p) {
+  const h = silenceEntry(p), k = editKey(p);
+  if (h.fast) return h;
+  if (!fastJobs.has(k)) {
+    fastJobs.set(k, provenSilent(p).then(r => {
+      if (r) r.forEach((v, i) => { if (v === true) h.tracks[i] = true; });
+      h.fast = true;
+      silence.save();
+    }).finally(() => fastJobs.delete(k)));
+  }
+  await fastJobs.get(k);
+  return h;
+}
+// which of these tracks are silent: the proof, then a full decode of what it couldn't settle (a check
+// already running is shared)
+const silenceJobs = new Map();
+async function silentTracks(p, tracks, low) {
+  const k = editKey(p);
+  const idx = [...new Set((Array.isArray(tracks) ? tracks : []).filter(i => Number.isInteger(i) && i >= 0))];
+  for (;;) {
+    const h = await quickSilent(p);
+    const todo = idx.filter(i => !(String(i) in h.tracks));
+    if (!todo.length) return idx.filter(i => h.tracks[i] === true);
+    if (silenceJobs.has(k)) { await silenceJobs.get(k).catch(() => {}); continue; }
+    const job = (async () => {
+      // all tracks at once; in the background at low priority
+      const r = await Promise.all(todo.map(i => trackSilent(p, i, low)));
+      todo.forEach((i, n) => { h.tracks[i] = r[n]; });
+      silence.save();
+    })();
+    silenceJobs.set(k, job);
+    try { await job; } finally { silenceJobs.delete(k); }
+  }
+}
+ipcMain.handle('qt-silent', wrap(async (_e, p, tracks) => {
+  if (!readable(p)) throw new Error('Not open.');
+  return { silent: await silentTracks(p, tracks) };
+}));
+// Encore clips on screen get their silent tracks worked out in the background (Home asks for the cards
+// showing once scrolling stops), so a clip opens with them already folded. A clip still being saved is
+// skipped; it's asked for again once it's done and on screen.
+const silenceQueue = [];
+let silenceBusy = false;
+ipcMain.handle('silence-prefetch', (_e, paths) => {
+  const all = silence.all();
+  const todo = (Array.isArray(paths) ? paths : []).filter(p => typeof p === 'string' && allowed(p)).filter(p => {
+    try { const st = fs.statSync(p), h = all[editKey(p)]; return st.size > 0 && !(h && h.full && h.stamp === `${st.size}:${Math.round(st.mtimeMs)}`); } catch (e) { return false; }
+  });
+  silenceQueue.length = 0; // only what's on screen now
+  silenceQueue.push(...todo);
+  runSilenceQueue();
+  return todo.length;
+});
+// the card under the mouse (or the clip next to the open one) goes first: it's the likeliest click
+ipcMain.handle('silence-first', (_e, p) => {
+  if (typeof p !== 'string' || !allowed(p)) return false;
+  const i = silenceQueue.findIndex(x => samePath(x, p));
+  if (i >= 0) silenceQueue.splice(i, 1);
+  silenceQueue.unshift(p);
+  runSilenceQueue();
+  return true;
+});
+async function runSilenceQueue() {
+  if (silenceBusy) return;
+  silenceBusy = true;
+  try {
+    while (silenceQueue.length) {
+      const p = silenceQueue.shift();
+      try {
+        const st = fs.statSync(p), h = silence.all()[editKey(p)];
+        if (!st.size || (h && h.full && h.stamp === `${st.size}:${Math.round(st.mtimeMs)}`)) continue;
+        if (Date.now() - st.mtimeMs < RECENT && openElsewhere(p)) continue;
+        const info = await probeVideo(p);
+        if (!info.encore) continue;
+        await silentTracks(p, audioGroups(info).flatMap(g => g.idx), true);
+        const done = silence.all()[editKey(p)];
+        if (done) { done.full = true; silence.save(); } // every row's tracks are known
+      } catch (e) { /* not readable yet */ }
+      await new Promise(r => setTimeout(r, 30));
+    }
+  } finally { silenceBusy = false; }
+}
 ipcMain.handle('qt-close', (_e, p) => { qtFiles.delete(editKey(p)); closeUnusedFds(); renamePending(p); });
 ipcMain.handle('qt-wave', wrap(async (_e, p, dur, buckets, tracks) => {
   if (!qtFiles.has(editKey(p))) throw new Error('Not open.');

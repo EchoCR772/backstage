@@ -143,6 +143,7 @@
         <div class="qt-card qt-trim">
           <label for="qtin">Start</label><input type="text" class="qt-t" id="qtin" spellcheck="false" title="Type a time and press Enter (I sets it to the playhead)">
           <label for="qtout">End</label><input type="text" class="qt-t" id="qtout" spellcheck="false" title="Type a time and press Enter (O sets it to the playhead)">
+          <div class="qt-speedrow"><label>Speed</label><div class="qt-speed" id="qtspeed"></div></div>
           <div class="qt-len"><b id="qtlen">0:00.00</b><span id="qtof"></span></div>
           <button class="btn sm ghost" id="qtreset" title="Back to the whole clip">Reset</button>
           <div class="qt-size" id="qtsize" title="Estimated size of the clip when you drag, copy or export it"></div>
@@ -205,6 +206,7 @@
 <div id="drop"><div class="drop-card"><div class="drop-icon"><span class="ico" data-ico="fileOpen"></span></div><div class="drop-title">Drop to edit</div><div class="drop-sub">Drop a folder to add it to your library</div></div></div>
 <div id="ctxmenu" hidden></div>
 <div id="tip" hidden></div>
+<script src="timemap.js"></script>
 <script type="module" src="engine.mjs"></script>
 <script src="app.js"></script>
 <script src="library.js"></script>

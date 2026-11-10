@@ -23,7 +23,7 @@ const qclamp = (x, a, b) => Math.min(b, Math.max(a, x));
 Q.hist = []; Q.future = []; Q.snap = null;
 // effects (crop, zoom, layers, added audio...): fx.mjs
 const FX = createFx({
-  Q, seekTo: t => seekTo(t), pause: () => pause(), toggle: () => stageToggle(), changed: () => scheduleSave(),
+  Q, seekTo: t => seekTo(t), pause: () => pause(), play: () => play(), toggle: () => stageToggle(), changed: () => scheduleSave(),
   status: (...a) => status(...a), audioChanged: () => syncSounds(), canvas: () => $('qtcanvas'), info: () => Q.info,
   gainsChanged: () => applyGains(), canUndo: () => Q.hist.length > 0, canRedo: () => Q.future.length > 0,
   toggleRow: key => { const g = Q.groups.find(x => x.key === key); if (g) { g.mute = !g.mute; applyGains(); buildAudioRows(); FX.renderAll(); scheduleSave(); } },
@@ -34,6 +34,9 @@ const FX = createFx({
   trimMove: t => { Q.t = t; if (Q.player) Q.player.show(t); },
   trimDone: which => { Q.t = which === 'in' ? Q.tin : Math.max(Q.tin, Q.tout - 1 / Q.fps); seekTo(Q.t); drawWave(); scheduleSave(); },
   panelChanged: () => window.qtSideChanged(), // a sidebar tab folded the panel away or opened it
+  silentOpen: () => !!Q.silentOpen, // the side panel's silent tracks are unfolded
+  // the timeline's time changed (a speed part, the trim's speed): the sound follows it
+  mapChanged: m => { if (Q.session) Q.session.setMap(m); },
 });
 const qpct = t => (Q.dur ? t / Q.dur * 100 : 0);
 let tabSeq = 0;
@@ -71,7 +74,8 @@ async function activate(tab, el) {
   Q.tab = tab;
   showEditor(true);
   startFrames();
-  if (Q.loaded !== tab) {
+  // a clip that didn't load (still saving, or an error) loads again when it's clicked again
+  if (Q.loaded !== tab || !Q.info) {
     if (Q.loaded) unload();
     await load(tab, el);
   }
@@ -96,6 +100,7 @@ window.qtApi = {
   toggle: () => toggle(), step: d => step(d), seek: d => seekTo(now() + d), loop: () => $('qtloop').click(),
   isLoop: () => Q.loop, hasPrev: () => !!neighbor(-1), hasNext: () => !!neighbor(1),
   copy: () => exportAs('video', 'clipboard'), rename: () => editTitle(),
+  t: () => Q.t, seekTo: t => seekTo(t), // tests: the playhead in clip time
 };
 
 function showEditor(on) {
@@ -137,7 +142,7 @@ async function load(tab, el) {
   const c = tab.clip;
   const gen = ++Q.gen;
   Q.loaded = tab;
-  Q.clip = c; Q.exporting = false; Q.playing = false; Q.peaks = tab.peaks; Q.info = null;
+  Q.clip = c; Q.exporting = false; Q.playing = false; Q.peaks = tab.peaks; Q.info = null; Q.silentOpen = false;
   el && el.classList.add('opening');
   showHead();
   renderClipList();
@@ -146,9 +151,22 @@ async function load(tab, el) {
   $('qtaudio').replaceChildren();
   clearCanvas($('qtstrip'));
 
-  const r = await T.qtOpen(c.path);
+  let r = await T.qtOpen(c.path);
   el && el.classList.remove('opening');
   if (gen !== Q.gen) return;
+  // a clip the recorder is still saving: say so and open it the moment it's done (the message waits a
+  // moment, so a program that only glances at the file doesn't make it flash)
+  if (r.ok && r.saving) {
+    const since = Date.now();
+    while (r.ok && r.saving) {
+      if (Date.now() - since > 300) $('qtmsg').textContent = "Still saving... It opens by itself when it's done.";
+      await new Promise(res => setTimeout(res, 250));
+      if (gen !== Q.gen) return;
+      r = await T.qtOpen(c.path);
+      if (gen !== Q.gen) return;
+    }
+    $('qtmsg').textContent = '';
+  }
   if (!r.ok) { status(r.error, 'err'); return; }
   const info = Q.info = r.info;
   if (r.title !== undefined && r.title !== c.title) { c.title = r.title; showHead(); }
@@ -161,6 +179,12 @@ async function load(tab, el) {
   if (Q.tout - Q.tin < 0.05) { Q.tin = 0; Q.tout = Q.dur; }
   Q.t = qclamp(st ? st.t : Q.tin, Q.tin, Q.tout);
   Q.groups = groupsFrom(info, st ? st.audio : e && e.audio);
+  Q.speed = cleanSpeed(st ? st.speed : e && e.speed);
+  renderSpeed();
+  // silent tracks come with the clip (main proves them while it opens), so the rows are built folded;
+  // tracks it couldn't settle are decoded in the background and fold later if they turn out silent
+  markSilent(r.silent || []);
+  if (info.encore && Q.groups.length > 1 && (!r.silent || (r.unsure && r.unsure.length))) findSilent(gen, c.path);
   FX.load(st ? st.fx : e && e.fx);
   // a clip that already has effects opens straight in Edit
   setLevel(st && st.level ? st.level : FX.hasContent() ? 'edit' : 'trim', true);
@@ -189,6 +213,7 @@ async function load(tab, el) {
     const specs = Q.groups.flatMap(g => g.idx.map(i => ({ key: 't' + i, path: c.path, index: i })))
       .concat(FX.sounds().filter(x => !x.missing).map(soundSpec), pieceSpecs(c.path));
     if (specs.length) Q.session = await window.ClipAudio.Session.open(specs, reader);
+    if (Q.session) Q.session.setMap(FX.map());
   } catch (err) { Q.session = null; status("The sound can't be previewed for this clip (the export still has it).", 'err', 8000); }
   if (gen !== Q.gen) { closeMedia(); return; }
   applyGains();
@@ -199,9 +224,29 @@ async function load(tab, el) {
   schedulePrepare(400);
   Q.hist = []; Q.future = []; Q.snap = snapNow(); FX.renderTools();
   startFrames();
+  // the clips before and after this one in the list are checked next, for stepping through them
+  for (const d of [1, -1]) { const n = neighbor(d); if (n && n.origin === 'encore' && n.kind !== 'export' && n.size > 0) T.silenceFirst(n.path); }
+}
+// Encore clips: rows whose tracks have no sound at all (main checks every sample; a single non-zero one
+// keeps the row) fold away under one line in the side panel and on Edit's timeline
+function markSilent(list) {
+  const s = new Set(list);
+  let changed = false;
+  for (const g of Q.groups) {
+    const v = g.idx.length > 0 && g.idx.every(i => s.has(i));
+    if (!!g.silent !== v) changed = true;
+    g.silent = v;
+  }
+  return changed;
+}
+async function findSilent(gen, path) {
+  const r = await T.qtSilent(path, Q.groups.flatMap(g => g.idx));
+  if (gen !== Q.gen || !r.ok) return;
+  if (markSilent(r.silent)) { buildAudioRows(); FX.renderAll(); }
 }
 window.qtFx = FX; // tests reach the effects through this
-const soundSpec = x => ({ key: 's' + x.id, path: x.path, index: 0, offset: x.from - x.at, from: x.from, to: x.to });
+// added sounds sit on the timeline (out): they play at their own speed wherever the clip is sped up
+const soundSpec = x => ({ key: 's' + x.id, path: x.path, index: 0, offset: x.from - x.at, from: x.from, to: x.to, out: true });
 // pieces of the clip's own sound rows (after a razor cut): each plays its part of every track in its row
 function pieceSpecs(path) {
   const out = [];
@@ -215,7 +260,7 @@ function pieceSpecs(path) {
 async function syncSounds() {
   const specs = FX.sounds().filter(x => !x.missing).map(soundSpec).concat(Q.clip ? pieceSpecs(Q.clip.path) : []);
   if (!Q.session && specs.length) {
-    try { await audioReady; Q.session = await window.ClipAudio.Session.open([], reader); } catch (e) { return; }
+    try { await audioReady; Q.session = await window.ClipAudio.Session.open([], reader); Q.session.setMap(FX.map()); } catch (e) { return; }
   }
   if (Q.session) {
     for (const key of [...Q.session.tracks.keys()]) if ((key[0] === 's' || key[0] === 'p') && !specs.some(x => x.key === key)) Q.session.remove(key);
@@ -234,7 +279,7 @@ function unload() {
   Q.gen++;
   pause();
   flushSave();
-  if (tab && Q.info) tab.st = { tin: Q.tin, tout: Q.tout, t: Q.t, audio: audioState(), fx: FX.state(), level: Q.level };
+  if (tab && Q.info) tab.st = { tin: Q.tin, tout: Q.tout, t: Q.t, audio: audioState(), fx: FX.state(), level: Q.level, speed: Q.speed };
   FX.unload();
   if (tab) tab.peaks = Q.peaks;
   closeMedia();
@@ -553,8 +598,35 @@ $('qttitlein').addEventListener('keydown', e => {
 });
 $('qttitlein').addEventListener('blur', () => endTitle(true));
 
+// ---------- speed (Trim's Speed row): the whole trim plays and exports at this speed, sound at its own pitch ----------
+const SPEEDS = [0.25, 0.5, 1, 1.5, 2, 4];
+const cleanSpeed = v => (SPEEDS.includes(+v) ? +v : 1);
+function renderSpeed() {
+  const box = $('qtspeed');
+  box.replaceChildren(...SPEEDS.map(v => {
+    const b = h('button', 'chip' + (v === Q.speed ? ' on' : ''), `${v}×`);
+    b.onclick = () => setSpeed(v);
+    return b;
+  }));
+}
+function setSpeed(v) {
+  if (!Q.info || v === Q.speed) return;
+  const at = now();
+  Q.speed = v;
+  renderSpeed();
+  FX.syncMap(); // the sound follows, and what's added on the timeline keeps its place on the clip
+  if (Q.playing && !Q.session) Q.base = { t: at, p: performance.now() }; // no sound: the clock goes on from here
+  scheduleSave();
+}
+
 // ---------- playback ----------
-const clock = () => (Q.starting ? Q.base.t : Q.session && Q.session.playing ? Q.session.audible : Q.base.t + (performance.now() - Q.base.p) / 1000);
+// with no sound playing, the picture keeps the timeline's time (speed parts included)
+const clock = () => {
+  if (Q.starting) return Q.base.t;
+  if (Q.session && Q.session.playing) return Q.session.audible;
+  const m = FX.map();
+  return m.toClip(m.toOut(Q.base.t) + (performance.now() - Q.base.p) / 1000);
+};
 async function play(from = Q.t) {
   if (!Q.player || !Q.dur) return;
   if (from < Q.tin - 0.01 || from >= Q.tout - 0.03) from = Q.tin;
@@ -621,10 +693,10 @@ function frame() {
   FX.frame(Q.t);
   if (Q.playing) applyGains();
   // fades in the preview: the picture over black
-  const fd = FX.fades();
+  const fd = FX.fades(), m = FX.map(), oa = m.toOut(Q.tin), oz = m.toOut(Q.tout), ot = m.toOut(Q.t);
   let vk = 1;
-  if (fd.vin) vk = Math.min(vk, qclamp((Q.t - Q.tin) / fd.vin, 0, 1));
-  if (fd.vout) vk = Math.min(vk, qclamp((Q.tout - Q.t) / fd.vout, 0, 1));
+  if (fd.vin) vk = Math.min(vk, qclamp((ot - oa) / fd.vin, 0, 1));
+  if (fd.vout) vk = Math.min(vk, qclamp((oz - ot) / fd.vout, 0, 1));
   $('qtview').style.opacity = vk;
   $('qtframe').textContent = `frame ${Math.round(Q.t * Q.fps)}`;
   $('qtph').style.left = qpct(Q.t) + '%';
@@ -632,12 +704,16 @@ function frame() {
   $('qtsel').style.width = `calc(${qpct(Q.tout) - qpct(Q.tin)}% + 8px)`;
   $('qtshadeL').style.width = qpct(Q.tin) + '%';
   $('qtshadeR').style.width = (100 - qpct(Q.tout)) + '%';
-  $('qtcur').textContent = $('etlcur').textContent = fmt(Q.t);
-  $('etllen').textContent = fmt(Q.tout - Q.tin);
-  $('qtlen').textContent = fmt(Q.tout - Q.tin);
+  // Edit shows the timeline's time; Trim the clip's
+  $('qtcur').textContent = fmt(Q.t);
+  $('etlcur').textContent = fmt(ot);
+  // with another speed, the length and size are those of the file it makes
+  const outLen = oz - oa;
+  $('etllen').textContent = fmt(outLen);
+  $('qtlen').textContent = fmt(outLen);
   $('qtof').textContent = ` of ${fmt(Q.dur)}`;
-  const whole = Q.tin <= 0.01 && Q.tout >= Q.dur - 0.01, sz = Q.info && Q.info.size;
-  $('qtsize').textContent = sz ? (whole ? `Size ${fmtSize(sz)}` : `Size ≈ ${fmtSize(estSize(sz, Q.tout - Q.tin, Q.dur))} (from ${fmtSize(sz)})`) : '';
+  const whole = Q.tin <= 0.01 && Q.tout >= Q.dur - 0.01 && m.identity, sz = Q.info && Q.info.size;
+  $('qtsize').textContent = sz ? (whole ? `Size ${fmtSize(sz)}` : `Size ≈ ${fmtSize(estSize(sz, outLen, Q.dur))} (from ${fmtSize(sz)})`) : '';
   if (document.activeElement !== $('qtin')) $('qtin').value = fmt(Q.tin);
   if (document.activeElement !== $('qtout')) $('qtout').value = fmt(Q.tout);
   $('qtreset').disabled = !(Q.tin > 0.01 || Q.tout < Q.dur - 0.01);
@@ -773,13 +849,14 @@ for (const [id, fn, get] of [['qtin', setIn, () => Q.tin], ['qtout', setOut, () 
 function editState() {
   const audio = audioState(), fx = FX.state();
   const trimmed = Q.tin > 0.01 || Q.tout < Q.dur - 0.01;
-  if (!trimmed && !Object.keys(audio).length && !fx) return null;
+  if (!trimmed && !Object.keys(audio).length && !fx && Q.speed === 1) return null;
   const e = { in: Math.round(Q.tin * 1000) / 1000, out: Math.round(Q.tout * 1000) / 1000, dur: Q.dur, audio };
   if (fx) e.fx = fx;
+  if (Q.speed !== 1) e.speed = Q.speed;
   return e;
 }
 // ---------- undo / redo (Ctrl+Z, Ctrl+Shift+Z): trims, audio rows and effects ----------
-const snapNow = () => JSON.stringify({ tin: Math.round(Q.tin * 1000) / 1000, tout: Math.round(Q.tout * 1000) / 1000, audio: audioState(), fx: FX.state() },
+const snapNow = () => JSON.stringify({ tin: Math.round(Q.tin * 1000) / 1000, tout: Math.round(Q.tout * 1000) / 1000, audio: audioState(), fx: FX.state(), speed: Q.speed },
   (k, v) => (k === 'png' || k === 'sig' || k === 'missing' ? undefined : v));
 function pushHistory() {
   const s = snapNow();
@@ -793,8 +870,10 @@ function applySnap(s) {
   const o = JSON.parse(s);
   pause();
   Q.tin = o.tin; Q.tout = o.tout;
+  Q.speed = cleanSpeed(o.speed); renderSpeed();
   for (const g of Q.groups) { const a = o.audio[g.key]; g.mute = !!(a && a.mute); g.vol = a ? qclamp(+a.vol, 0, 2) : 1; }
   FX.load(o.fx, true); // keeps the tool in use (drawing goes on after Ctrl+Z)
+  if (Q.session) Q.session.setMap(FX.map());
   Q.snap = s;
   seekTo(qclamp(Q.t, Q.tin, Q.tout));
   drawWave();
@@ -809,7 +888,7 @@ function scheduleSave() { clearTimeout(Q.saveTimer); Q.saveTimer = setTimeout(fl
 function schedulePrepare(ms = 900) {
   clearTimeout(Q.prepTimer);
   Q.prepTimer = setTimeout(() => {
-    if (!Q.loaded || !Q.info || Q.drag || !editState() || FX.state()) return; // effects take a full encode: made when asked
+    if (!Q.loaded || !Q.info || Q.drag || !editState() || FX.state() || Q.speed !== 1) return; // effects and speed take a full encode: made when asked
     T.qtPrepare({ path: Q.clip.path, start: Q.tin, end: Q.tout, audio: audioState() });
   }, ms);
 }
@@ -831,8 +910,18 @@ function buildAudioRows() {
   const box = $('qtaudio');
   box.replaceChildren();
   if (!Q.groups.length && !FX.sounds().length) { box.append(h('div', 'qt-none', 'This clip has no sound.')); }
-  for (const g of Q.groups) {
-    const row = h('div', 'qt-arow' + (g.open ? ' open' : '') + (g.mute ? ' muted' : ''));
+  const quiet = Q.groups.filter(g => g.silent);
+  for (const g of Q.groups) if (!g.silent) box.append(groupRow(g));
+  if (quiet.length) {
+    const fold = h('button', 'qt-silentfold' + (Q.silentOpen ? ' open' : ''));
+    fold.title = 'These tracks have no sound at all in this clip';
+    fold.append(icoSpan('chev'), h('span', '', `${quiet.length} silent track${quiet.length > 1 ? 's' : ''}`));
+    fold.onclick = () => { Q.silentOpen = !Q.silentOpen; buildAudioRows(); FX.renderAll(); };
+    box.append(fold);
+    if (Q.silentOpen) for (const g of quiet) box.append(groupRow(g));
+  }
+  function groupRow(g) {
+    const row = h('div', 'qt-arow' + (g.open ? ' open' : '') + (g.mute ? ' muted' : '') + (g.silent ? ' silent' : ''));
     const head = h('div', 'qt-ahead');
     const name = h('button', 'qt-aname');
     name.title = 'Volume';
@@ -864,7 +953,7 @@ function buildAudioRows() {
       sl.append(r, v);
       row.append(sl);
     }
-    box.append(row);
+    return row;
   }
   // added audio (music, sound effects)
   for (const x of FX.sounds()) {
@@ -939,15 +1028,15 @@ function nameRow(row, g) {
 // each row's volume, following its volume points and the sound fades
 function applyGains() {
   if (!Q.session) return;
-  const t = Q.playing ? clock() : Q.t, vp = FX.allPts(), fd = FX.fades();
+  const t = Q.playing ? clock() : Q.t, vp = FX.allPts(), fd = FX.fades(), m = FX.map(), o = m.toOut(t);
   let k = 1;
-  if (fd.ain) k = Math.min(k, qclamp((t - Q.tin) / fd.ain, 0, 1));
-  if (fd.aout) k = Math.min(k, qclamp((Q.tout - t) / fd.aout, 0, 1));
+  if (fd.ain) k = Math.min(k, qclamp((o - m.toOut(Q.tin)) / fd.ain, 0, 1));
+  if (fd.aout) k = Math.min(k, qclamp((m.toOut(Q.tout) - o) / fd.aout, 0, 1));
   // a cut row plays through its pieces only
   const cuts = FX.cuts();
   for (const g of Q.groups) for (const i of g.idx) Q.session.setGain('t' + i, g.mute || cuts[g.key] ? 0 : g.vol * curveAt(vp[g.key], t) * k);
   if (Object.keys(cuts).length) for (const sp of pieceSpecs('')) { const g = Q.groups.find(x => x.key === sp.row), p = sp.piece; Q.session.setGain(sp.key, g.mute || p.mute ? 0 : g.vol * (p.vol ?? 1) * curveAt(vp[g.key], t) * k); }
-  for (const x of FX.sounds()) Q.session.setGain('s' + x.id, FX.aMuted(x) ? 0 : x.vol * curveAt(vp['s:' + x.id], t) * k);
+  for (const x of FX.sounds()) Q.session.setGain('s' + x.id, FX.aMuted(x) ? 0 : x.vol * curveAt(vp['s:' + x.id], o) * k);
 }
 
 // listening volume (shared with the rest of the app; never changes the export)
@@ -1007,7 +1096,7 @@ async function exportAs(as, dest, target) {
   $('qt').classList.add('busy');
   // Copy Video is usually ready already; only show progress if it takes a moment
   const slow = setTimeout(() => { $('qtbar').hidden = false; $('qtbar').value = 0; working(dest === 'clipboard' ? `Making the ${as === 'audio' ? 'audio' : 'clip'}...` : 'Exporting...'); }, dest === 'clipboard' && !target ? 250 : 0);
-  const r = await T.qtExport({ path: Q.clip.path, start: Q.tin, end: Q.tout, as, dest, audio: audioState(), fx: FX.state(), target: target || 0 });
+  const r = await T.qtExport({ path: Q.clip.path, start: Q.tin, end: Q.tout, as, dest, audio: audioState(), fx: FX.state(), speed: Q.speed, target: target || 0 });
   clearTimeout(slow);
   Q.exporting = false;
   $('qt').classList.remove('busy');

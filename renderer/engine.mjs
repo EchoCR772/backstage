@@ -7,6 +7,7 @@
 // element is muted and follows this clock (see syncVideo in app.js).
 
 import { Input, ALL_FORMATS, CustomSource, AudioBufferSink } from './vendor/mediabunny.min.mjs';
+import { Stretcher } from './stretch.mjs';
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const LEAD = 0.03;      // seconds between asking to play and the first scheduled sample
@@ -29,6 +30,9 @@ function setListen(v) {
   if (listen) listen.gain.setTargetAtTime(v, ctx.currentTime, 0.012);
 }
 
+// a map that leaves time alone (no speed anywhere)
+const SAME = { identity: true, toOut: t => t, toClip: t => t, between: (a, b) => [{ c0: a, c1: b, o0: a, rate: 1, mute: false }] };
+
 class Session {
   constructor() {
     this.ctx = getCtx();
@@ -37,15 +41,19 @@ class Session {
     this.tracks = new Map();   // key -> { sink, gain }
     this.inputs = [];
     this.playing = false;
-    this.pos = 0;              // clip time at startCtx (or the paused position)
+    this.opos = 0;             // timeline time at startCtx (or the paused position)
     this.startCtx = 0;
     this.gen = 0;              // bumped on every stop so stale decode loops quit
     this.nodes = new Set();
     this.closed = false;
+    // The timeline's time (TimeMap): the clip's own sound follows it (sped up or slowed down with its
+    // pitch kept, silent in a muted part); added sounds play on the timeline at their own speed.
+    this.map = SAME;
   }
 
-  // specs: [{ key, path, index, offset?, from?, to? }]; reader: { size(path), read(path, start, end) }
-  // An added sound plays file time `from`..`to`; file time = clip time + offset.
+  // specs: [{ key, path, index, offset?, from?, to?, out? }]; reader: { size(path), read(path, start, end) }
+  // A sound plays file time `from`..`to`; file time = clip time + offset, or timeline time + offset
+  // for an added sound (out: true).
   static async open(specs, reader) {
     const s = new Session();
     s.reader = reader;
@@ -79,9 +87,9 @@ class Session {
     const gain = this.ctx.createGain();
     gain.gain.value = 0;
     gain.connect(this.master);
-    const t = { sink: new AudioBufferSink(tr), gain, offset: sp.offset || 0, from: sp.from ?? null, to: sp.to ?? null };
+    const t = { sink: new AudioBufferSink(tr), gain, offset: sp.offset || 0, from: sp.from ?? null, to: sp.to ?? null, out: !!sp.out };
     this.tracks.set(sp.key, t);
-    if (this.playing) this.pump(t, this.gen, Math.max(0, this.time));
+    if (this.playing) this.pump(t, this.gen);
     return true;
   }
   remove(key) {
@@ -111,11 +119,23 @@ class Session {
     if (out > 0) knownLatency = (this.ctx.baseLatency || 0) + out;
     return knownLatency;
   }
+  // timeline time of the sample being handed to the output right now
+  get otime() { return this.playing ? this.ctx.currentTime - this.startCtx + this.opos : this.opos; }
   // clip time of the sample being handed to the output right now
-  get time() { return this.playing ? this.ctx.currentTime - this.startCtx + this.pos : this.pos; }
+  get time() { return this.map.toClip(this.otime); }
   // clip time of what is actually coming out of the speakers (latency fixed per play() so the
   // estimate doesn't jump mid-playback)
-  get audible() { return this.playing ? this.time - this.lat : this.pos; }
+  get audible() { return this.playing ? this.map.toClip(this.otime - this.lat) : this.map.toClip(this.opos); }
+  // the timeline's time changed (a speed part, the trim's speed): playing carries on from the same moment
+  setMap(m) {
+    m = m || SAME;
+    if (m === this.map || (m.sig && m.sig === this.map.sig)) { this.map = m; return; }
+    const at = this.audible;
+    if (!this.playing) { this.map = m; this.opos = m.toOut(at); return; }
+    this.playing = false; this.halt();
+    this.map = m;
+    this.play(at);
+  }
 
   // Start so that clip time `pos` is heard right now - i.e. in step with a video that starts
   // playing from `pos` at the same moment. The first few tens of milliseconds of audio (the
@@ -129,29 +149,48 @@ class Session {
     this.halt();
     this.lat = this.latency;
     const skip = LEAD + this.lat - videoLag;
-    this.pos = pos + skip;
+    this.opos = this.map.toOut(pos) + skip;
     this.startCtx = this.ctx.currentTime + LEAD;
     this.playing = true;
     const gen = this.gen;
-    for (const t of this.tracks.values()) this.pump(t, gen, Math.max(0, this.pos));
+    for (const t of this.tracks.values()) this.pump(t, gen);
   }
   pause() {
     if (!this.playing) return;
-    this.pos = this.audible;
+    this.opos = this.otime - this.lat;
     this.playing = false;
     this.halt();
   }
-  seek(pos) { if (this.playing) this.play(pos); else this.pos = pos; }
+  seek(pos) { if (this.playing) this.play(pos); else this.opos = this.map.toOut(pos); }
   halt() {
     this.gen++;
     for (const n of this.nodes) { try { n.stop(); } catch (e) { /* already stopped */ } }
     this.nodes.clear();
   }
 
-  async pump(t, gen, pos) {
-    const off = t.offset || 0, from = t.from, to = t.to;
-    const fpos = Math.max(from ?? 0, pos + off);
+  async pump(t, gen) {
+    const map = this.map, off = t.offset || 0, from = t.from, to = t.to;
+    // where this track's file starts playing: timeline time for added sounds, clip time for the clip's own
+    const here = t.out ? Math.max(0, this.opos) : Math.max(0, map.toClip(Math.max(0, this.opos)));
+    const fpos = Math.max(from ?? 0, here + off);
     if (to != null && fpos >= to) return;
+    // context time a file time is heard at
+    const when = ft => this.startCtx + ((t.out ? ft - off : map.toOut(ft - off)) - this.opos);
+    const startNode = (buffer, at, skip, len) => {
+      const now = this.ctx.currentTime;
+      const node = this.ctx.createBufferSource();
+      node.buffer = buffer;
+      node.connect(t.gain);
+      if (at >= now) node.start(at, skip, len);
+      else if (now - at < len) node.start(now, skip + now - at, len - (now - at)); // late: skip what already passed
+      else { node.disconnect(); return; }
+      this.nodes.add(node);
+      node.onended = () => this.nodes.delete(node);
+    };
+    // another speed somewhere: the clip's sound goes through one time-stretcher (at 1x it passes the
+    // sound through unchanged) and comes out as one continuous stream; a muted part starts it afresh
+    const plain = t.out || map.identity;
+    let st = null, outAt = 0;
     try {
       for await (const { buffer, timestamp } of t.sink.buffers(fpos)) {
         if (gen !== this.gen || t.dead) return;
@@ -160,17 +199,27 @@ class Session {
         const skip = from != null && timestamp < from ? from - timestamp : 0;
         const len = (to != null ? Math.min(buffer.duration, to - timestamp) : buffer.duration) - skip;
         if (len <= 0) continue;
-        const when = this.startCtx + (timestamp + skip - off - this.pos);
-        const now = this.ctx.currentTime;
-        const node = this.ctx.createBufferSource();
-        node.buffer = buffer;
-        node.connect(t.gain);
-        if (when >= now) node.start(when, skip, len);
-        else if (now - when < len) node.start(now, skip + now - when, len - (now - when)); // late: skip what already passed
-        else { node.disconnect(); continue; }
-        this.nodes.add(node);
-        node.onended = () => this.nodes.delete(node);
-        while (gen === this.gen && timestamp - off - this.time > AHEAD) await sleep(60);
+        if (plain) startNode(buffer, when(timestamp + skip), skip, len);
+        else {
+          const sr = buffer.sampleRate, ca = timestamp + skip - off;
+          for (const sg of map.between(ca, ca + len)) {
+            if (sg.mute) { st = null; continue; }
+            const i0 = Math.round((sg.c0 - (timestamp - off)) * sr), n = Math.max(0, Math.min(buffer.length - i0, Math.round((sg.c1 - sg.c0) * sr)));
+            if (!n) continue;
+            if (!st) { st = new Stretcher(buffer.numberOfChannels, sg.rate); outAt = when(sg.c0 + off); }
+            st.rate = sg.rate;
+            const chans = [];
+            for (let c = 0; c < buffer.numberOfChannels; c++) chans.push(buffer.getChannelData(c).subarray(i0, i0 + n));
+            const out = st.push(chans);
+            if (out[0].length) {
+              const ab = this.ctx.createBuffer(out.length, out[0].length, sr);
+              out.forEach((d, c) => ab.copyToChannel(d, c));
+              startNode(ab, outAt, 0, ab.duration);
+              outAt += ab.duration;
+            }
+          }
+        }
+        while (gen === this.gen && when(timestamp) - this.ctx.currentTime > AHEAD) await sleep(60);
         if (gen !== this.gen) return;
       }
     } catch (e) {
