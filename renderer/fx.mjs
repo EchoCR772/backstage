@@ -177,8 +177,8 @@ const labelOf = l => (l.type === 'speed' ? `${l.rate}×${l.mute ? ', muted' : ''
   : l.type === 'shape' ? (SHAPES.find(s => s[0] === l.shape) || [0, 'Shape'])[1] : l.name || NAMES[l.type]);
 
 export function createFx(ctx) {
-  // ctx: { Q, seekTo(t), pause(), toggle(), changed(), status(), audioChanged(), canvas(), info(),
-  //        gainsChanged(), canUndo(), canRedo() }
+  // ctx: { Q, seekTo(t), pause(), toggle(), changed(), changedNow() (save the undo step now), status(),
+  //        audioChanged(), canvas(), compositor() (the WebGPU player's, or null), info(), gainsChanged(), canUndo(), canRedo() }
   const F = {
     fx: emptyFx(), sel: null, tool: null, drag: null, cropAspect: 0, cropLock: false, draft: null, peaks: new Map(), ver: 0, drawKey: '',
     brush: { c: '#f23f43', s: 0.008, e: false }, clipboard: null,
@@ -336,41 +336,63 @@ export function createFx(ctx) {
     const k = Math.min(st.clientWidth / fw, st.clientHeight / fh);
     const w = Math.floor(fw * k), hh = Math.floor(fh * k);
     if (view.style.width !== w + 'px' || view.style.height !== hh + 'px') { view.style.width = w + 'px'; view.style.height = hh + 'px'; }
-    const cw = w / r.w, ch = hh / r.h;
-    el.style.width = cw + 'px'; el.style.height = ch + 'px';
-    el.style.left = -r.x * cw + 'px'; el.style.top = -r.y * ch + 'px';
-    if (F.tool === 'crop') { levels.replaceChildren(); F.drawKey = ''; } else drawLevels(t, w, hh);
+    const comp = el === ctx.canvas() && ctx.compositor();
+    if (comp) {
+      // WebGPU: the canvas is the view, and the player draws the visible part of the clip into it
+      if (el.style.width !== w + 'px' || el.style.height !== hh + 'px' || el.style.left !== '0px') { el.style.width = w + 'px'; el.style.height = hh + 'px'; el.style.left = '0px'; el.style.top = '0px'; }
+      const dpr = devicePixelRatio || 1;
+      comp.setView(w * dpr, hh * dpr, r);
+    } else {
+      const cw = w / r.w, ch = hh / r.h;
+      el.style.width = cw + 'px'; el.style.height = ch + 'px';
+      el.style.left = -r.x * cw + 'px'; el.style.top = -r.y * ch + 'px';
+    }
+    if (F.tool === 'crop') { levels.replaceChildren(); if (comp && F.drawKey !== 'crop' + comp.id) comp.setLevels([]); F.drawKey = comp ? 'crop' + comp.id : ''; } else drawLevels(t, w, hh, comp);
     renderEdit(w, hh);
   }
-  // one level per video track, bottom first: its blur boxes, then a canvas with its drawn layers
-  function drawLevels(t, w, hh) {
+  // one level per video track, bottom first: its blur boxes, then a canvas with its drawn layers.
+  // With the compositor (WebGPU) the levels go to the player instead of the page.
+  function drawLevels(t, w, hh, comp) {
     const dpr = devicePixelRatio || 1;
     const ot = M().toOut(t), on = F.fx.layers.filter(l => !onV1(l) && !vHidden(l) && ot >= l.start && ot < l.end);
-    const key = [F.ver, w, hh, dpr, on.map(l => l.id + (l.type === 'image' && !imageFor(l.url).complete ? '?' : '')).join(',')].join('|');
+    const key = [comp ? comp.id : 0, F.ver, w, hh, dpr, on.map(l => l.id + (l.type === 'image' && !imageFor(l.url).complete ? '?' : '')).join(',')].join('|');
     if (key === F.drawKey) return;
     F.drawKey = key;
     levels.replaceChildren();
-    const o = out(), n = Math.max(0, ...on.map(l => (l.track | 0) + 1));
+    const o = out(), n = Math.max(0, ...on.map(l => (l.track | 0) + 1)), gl = [];
+    const wet = inkStroke();
+    if (!wet) clearInk();
     for (let i = 0; i < n; i++) {
       const mine = on.filter(l => (l.track | 0) === i);
       if (!mine.length) continue;
+      const lv = { blurs: [], canvas: null };
+      gl.push(lv);
       for (const l of mine.filter(x => x.type === 'blur')) {
+        // the export's boxblur radius is strength x height / 120, about a Gaussian of that sigma
+        if (comp) { lv.blurs.push({ box: l.box, sigma: l.strength * hh * dpr / 120 }); continue; }
         const d = h('div', 'fx-blur');
         d.style.left = l.box.x * 100 + '%'; d.style.top = l.box.y * 100 + '%'; d.style.width = l.box.w * 100 + '%'; d.style.height = l.box.h * 100 + '%';
         d.style.backdropFilter = `blur(${Math.round(l.strength * o.h / 120 * hh / o.h * 10) / 10}px)`;
         levels.append(d);
       }
-      const draw = mine.filter(x => OVER.has(x.type));
+      // the stroke being drawn stays out until the mouse is let go (it's on the ink canvas meanwhile)
+      const draw = mine.filter(x => OVER.has(x.type)).map(x => (comp && wet && x.strokes && x.strokes.includes(wet) ? { ...x, strokes: x.strokes.filter(y => y !== wet) } : x));
       if (!draw.length) continue;
+      // the compositor keeps each track's picture: one that hasn't changed isn't drawn or uploaded again
+      // (while drawing, only the track being drawn on changes)
+      const sig = comp && JSON.stringify([w, hh, dpr, draw.map(l => [l.type, l.text, l.x, l.y, l.size, l.color, l.bold, l.style, l.url, l.w, l.ar, l.shape, l.box, l.x1, l.y1, l.x2, l.y2, l.fill, l.stroke, l.strokes, l.type === 'image' && imageFor(l.url).complete])]);
+      if (comp) { const old = F.lvCache && F.lvCache.get(sig); if (old) { lv.canvas = old; continue; } }
       const c = h('canvas', 'fx-level');
+      if (comp) c.sig = sig;
       c.width = Math.round(w * dpr); c.height = Math.round(hh * dpr);
       const g = c.getContext('2d');
       for (const l of draw) {
         if (l.type === 'image' && !imageFor(l.url).complete) imageFor(l.url).ready.then(() => { F.drawKey = ''; });
         drawLayer(g, l, c.width, c.height, w / hh);
       }
-      levels.append(c);
+      if (comp) lv.canvas = c; else levels.append(c);
     }
+    if (comp) { F.lvCache = new Map(gl.filter(x => x.canvas).map(x => [x.canvas.sig, x.canvas])); comp.setLevels(gl); }
   }
 
   // ---------- handles on the picture ----------
@@ -462,9 +484,11 @@ export function createFx(ctx) {
     showGuides([]);
     // a click on the picture plays or pauses, and lets go of what was selected
     if (d.click) { if (d.wasSel && F.sel !== 'clip') select(null); ctx.toggle(); return; }
-    if (d.draw) { changed(); return; }
-    if (d.crop) { F.fx.crop = isFull(F.draft) ? null : F.draft; F.draft = null; changed(); return; }
-    if (d.moved) changed();
+    // the end of a stroke or a drag is one undo step, saved at once (not after the usual short wait,
+    // which let a quick second stroke join the first)
+    if (d.draw) { changed(); ctx.changedNow(); return; }
+    if (d.crop) { F.fx.crop = isFull(F.draft) ? null : F.draft; F.draft = null; changed(); ctx.changedNow(); return; }
+    if (d.moved) { changed(); ctx.changedNow(); }
   };
   for (const ev of ['pointerup', 'pointercancel', 'lostpointercapture']) edit.addEventListener(ev, endEdit);
   edit.addEventListener('click', e => e.stopPropagation());
@@ -576,7 +600,27 @@ export function createFx(ctx) {
     const s = { c: F.brush.c, s: F.brush.s, e: F.brush.e, p: [r4(p.x), r4(p.y)] };
     l.strokes.push(s);
     F.drag = { draw: true, s, last: p };
+    if (inkStroke()) inkLine(s, 0);
     bump();
+  }
+  // With the compositor, a stroke being drawn goes on a plain canvas over the picture, a bit of line per
+  // move, and to the GPU once the mouse is let go (uploading the drawing on every move was slow on
+  // weaker graphics). The eraser can't work that way (it cuts into what's there): it redraws as it goes.
+  const ink = h('canvas', 'fx-level fx-ink'); ink.hidden = true;
+  view.insertBefore(ink, edit);
+  const inkStroke = () => (F.drag && F.drag.draw && !F.drag.s.e && ctx.compositor() ? F.drag.s : null);
+  function clearInk() { if (!ink.hidden) { ink.hidden = true; ink.getContext('2d').clearRect(0, 0, ink.width, ink.height); } }
+  function inkLine(s, from) {
+    const W = Math.round(view.clientWidth * (devicePixelRatio || 1)), H = Math.round(view.clientHeight * (devicePixelRatio || 1));
+    if (ink.hidden) { ink.width = W; ink.height = H; ink.hidden = false; }
+    const x = ink.getContext('2d'), p = s.p;
+    x.lineCap = 'round'; x.lineJoin = 'round'; x.strokeStyle = s.c; x.lineWidth = Math.max(1, s.s * ink.height);
+    x.beginPath();
+    const i = Math.max(0, from - 2);
+    x.moveTo(p[i] * ink.width, p[i + 1] * ink.height);
+    if (p.length === 2) x.lineTo(p[0] * ink.width + 0.01, p[1] * ink.height);
+    for (let j = i + 2; j < p.length; j += 2) x.lineTo(p[j] * ink.width, p[j + 1] * ink.height);
+    x.stroke();
   }
   // the brush outline: a circle the size the stroke will be (dashed for the eraser), in place of a cursor
   const brushEl = h('div', 'fx-brush'); brushEl.hidden = true; document.body.append(brushEl);
@@ -595,6 +639,7 @@ export function createFx(ctx) {
     const d = F.drag;
     if (Math.hypot((p.x - d.last.x) * p.rw, (p.y - d.last.y) * p.rh) < 2) return;
     d.s.p.push(r4(p.x), r4(p.y)); d.last = p;
+    if (inkStroke()) inkLine(d.s, d.s.p.length - 2);
     bump();
   }
 
@@ -1947,6 +1992,6 @@ export function createFx(ctx) {
     map: () => M(), syncMap: () => { if (syncMap()) { bump(); renderAll(); } },
     setState(fx) { load(fx); ctx.changed(); }, // tests
     thumbCount: () => TH.frames.size, // tests
-    unload() { resetThumbs(); F.sel = null; F.tool = null; F.drag = null; levels.replaceChildren(); edit.replaceChildren(); edit.dataset.key = ''; F.drawKey = ''; },
+    unload() { resetThumbs(); F.sel = null; F.tool = null; F.drag = null; clearInk(); levels.replaceChildren(); edit.replaceChildren(); edit.dataset.key = ''; F.drawKey = ''; },
   };
 }

@@ -23,8 +23,8 @@ const qclamp = (x, a, b) => Math.min(b, Math.max(a, x));
 Q.hist = []; Q.future = []; Q.snap = null;
 // effects (crop, zoom, layers, added audio...): fx.mjs
 const FX = createFx({
-  Q, seekTo: t => seekTo(t), pause: () => pause(), play: () => play(), toggle: () => stageToggle(), changed: () => scheduleSave(),
-  status: (...a) => status(...a), audioChanged: () => syncSounds(), canvas: () => $('qtcanvas'), info: () => Q.info,
+  Q, seekTo: t => seekTo(t), pause: () => pause(), play: () => play(), toggle: () => stageToggle(), changed: () => scheduleSave(), changedNow: () => flushSave(),
+  status: (...a) => status(...a), audioChanged: () => syncSounds(), canvas: () => $('qtcanvas'), compositor: () => (Q.player && Q.player.compositor) || null, info: () => Q.info,
   gainsChanged: () => applyGains(), canUndo: () => Q.hist.length > 0, canRedo: () => Q.future.length > 0,
   toggleRow: key => { const g = Q.groups.find(x => x.key === key); if (g) { g.mute = !g.mute; applyGains(); buildAudioRows(); FX.renderAll(); scheduleSave(); } },
   // a sound row's volume from Edit's Properties (the side panel's slider shows the same)
@@ -896,13 +896,16 @@ async function flushSave() {
   if (!Q.saveTimer || !Q.clip || !Q.info) return;
   clearTimeout(Q.saveTimer); Q.saveTimer = null;
   const clip = Q.clip, hold = Q.hold;
+  // the undo step is the state right now: a stroke started while the pictures below are being made
+  // belongs to the next step (two quick strokes were undone together)
+  pushHistory();
   await FX.rasterize(); // text, pictures, shapes and drawings as PNGs for the export
-  if (hold) { if (Q.clip === clip) { pushHistory(); showSaveState(); } return; } // Edit, not saved yet
+  if (hold) { if (Q.clip === clip) showSaveState(); return; } // Edit, not saved yet
   const e = editState();
   clip.edit = e;
   await T.qtEdit(clip.path, e);
   updateCardEdit(clip);
-  if (Q.clip === clip) { pushHistory(); refreshListCard(clip); }
+  if (Q.clip === clip) refreshListCard(clip);
 }
 
 // ---------- audio rows ----------

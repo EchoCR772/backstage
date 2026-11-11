@@ -1462,12 +1462,12 @@ async function fileFacts(full, name, st) {
     saveIndexSoon();
   }
   // the file's own tags (recorder and Backstage markers); older index entries get them once
-  if (e.tagsV !== 2) { // 2: Encore 0.9.36's tags
-    e.tagsV = 2;
+  if (e.tagsV !== 3) { // 2: Encore 0.9.36's tags, 3: with encore_game_exe
+    e.tagsV = 3;
     const t = /\.(mp4|m4v|mov)$/i.test(name) ? await readMp4Tags(full, st.size) : null;
     e.tags = {};
     // Encore's (its file contract: one-line values up to 200 characters, unknown tags ignored) and Backstage's own
-    for (const k of ['encore_kind', 'encore_game', 'encore_id', 'backstage', 'backstage_kind', 'backstage_origin', 'backstage_game', 'backstage_date']) if (t && t[k]) e.tags[k] = String(t[k]).slice(0, 200);
+    for (const k of ['encore_kind', 'encore_game', 'encore_game_exe', 'encore_id', 'backstage', 'backstage_kind', 'backstage_origin', 'backstage_game', 'backstage_date']) if (t && t[k]) e.tags[k] = String(t[k]).slice(0, 200);
     if (t && Object.keys(t).some(k => k.startsWith('encore_'))) e.tags.encore = '1'; // any encore_ tag: Encore made it (a recovered file has only encore_id)
     saveIndexSoon();
   }
@@ -1492,7 +1492,10 @@ function clipFacts(name, st, e, folder, source) {
   if (game !== 'Other' && isDesktopName(game)) game = 'Desktop';
   const c = classify(name, meta, tags, k, source);
   const origin = tags.backstage_origin && SOURCES.has(tags.backstage_origin) ? tags.backstage_origin : (k && k.origin) || (tags.encore ? 'encore' : clipOrigin(base, meta, source));
-  return { date, game, rawGame, fromName: !(meta && meta.app) && !named && (folder === null || folder === undefined) && !!dn, ...c, origin };
+  // Encore's program name groups the clip with the same game from other recorders (Discord's list has
+  // each game's programs); not for a Backstage export that was given its own game
+  const exe = !tags.backstage_game && !(k && k.game) && tags.encore_game_exe ? tags.encore_game_exe : '';
+  return { date, game, rawGame, exe, fromName: !(meta && meta.app) && !named && (folder === null || folder === undefined) && !!dn, ...c, origin };
 }
 const SOURCES = new Set(['discord', 'nvidia', 'encore']);
 
@@ -1516,7 +1519,7 @@ async function scanFolder(root, kind, out, progress) {
       const f = clipFacts(d.name, st, e, folder, kind);
       out.push({
         path: full, root, url: pathToFileURL(full).href, name: d.name, sub, date: f.date, size: st.size, mtime: Math.round(st.mtimeMs),
-        source: kind, kind: f.kind, type: f.type, edited: f.edited, origin: f.origin, gameName: f.game, rawGame: f.rawGame, fromName: f.fromName,
+        source: kind, kind: f.kind, type: f.type, edited: f.edited, origin: f.origin, gameName: f.game, rawGame: f.rawGame, exe: f.exe, fromName: f.fromName,
         duration: e.error ? null : (e.duration || null), users: meta ? meta.users : [], edit: editFor(full),
         title: names.all()[nameKey(st, meta, e.tags)] || null,
       });
@@ -1550,16 +1553,21 @@ async function scanLibrary() {
   // and "Overwatch 2") becomes one entry: by Discord's list of games when the name is in it, else
   // by its letters and numbers. Named after whichever spelling has the most clips.
   const idx = await Promise.race([loadGameIndex().catch(() => null), new Promise(r => setTimeout(() => r(null), 4000))]);
+  // An Encore clip's program (encore_game_exe) is checked first: it stays the same when the name
+  // doesn't match ("Call of Duty" vs "Call of Duty®: Black Ops 6").
   const appOf = new Map();
-  const keyOf = name => {
+  const keyOf = (name, exe) => {
     const plain = name.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim() || 'other';
     if (!idx || /^(desktop|other)$/i.test(name)) return plain;
+    const byExe = exe && idx.exes.get(exeKey(exe));
+    if (byExe) { groupApps.set(name, byExe); return 'app:' + byExe.id; }
     if (!appOf.has(name)) { let hit = null; for (const k of nameVariants(name)) { hit = idx.get(k); if (hit) break; } appOf.set(name, hit ? 'app:' + hit.id : plain); }
     return appOf.get(name);
   };
   const games = new Map();
   for (const c of clipsOut) {
-    const key = keyOf(c.gameName);
+    const key = keyOf(c.gameName, c.exe);
+    delete c.exe;
     let g = games.get(key);
     if (!g) { g = { key, names: new Map(), count: 0, size: 0, latest: 0, latestPath: null }; games.set(key, g); }
     g.names.set(c.gameName, (g.names.get(c.gameName) || 0) + 1);
@@ -1638,6 +1646,9 @@ async function makeThumb(p) {
 const iconDir = () => path.join(app.getPath('userData'), 'icons');
 let gameIndex = null, gameIndexLoading = null;
 const flatName = x => String(x).toLowerCase().replace(/[^a-z0-9]+/g, '');
+// a program's file name as Discord's list and Encore write it ("VALORANT-Win64-Shipping.exe", "_retail_/wow.exe")
+const exeKey = x => String(x).toLowerCase().replace(/\\/g, '/').split('/').pop().replace(/^>/, '').trim();
+const groupApps = new Map(); // a game's name -> the Discord game its clips were matched to by program
 async function loadGameIndex() {
   if (gameIndex) return gameIndex;
   if (gameIndexLoading) return gameIndexLoading;
@@ -1647,21 +1658,34 @@ async function loadGameIndex() {
     try {
       const st = fs.statSync(file);
       if (Date.now() - st.mtimeMs < 7 * 24 * 3600 * 1000) list = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (Array.isArray(list)) list = null; // the old format has no programs: download again (kept if offline)
     } catch (e) { /* not downloaded yet */ }
     if (!list) {
       try {
         const res = await net.fetch('https://discord.com/api/v9/applications/detectable');
         if (res.ok) {
           const all = await res.json();
-          // keep only what's needed: about 1 MB instead of 13
-          list = all.filter(a => a && a.icon_hash && a.name).map(a => [a.id, a.icon_hash, a.name, ...(a.aliases || [])]);
+          // keep only what's needed: about 1 MB instead of 13. Each game: id, icon, its Windows
+          // programs (launchers left out) joined with |, then its names
+          // (only names a single game in the whole list uses: "wow.exe" is World of Warcraft and its Classic)
+          const exes = a => [...new Set((a && a.executables || []).filter(x => x && x.os === 'win32' && !x.is_launcher && x.name).map(x => exeKey(x.name)).filter(Boolean))];
+          const uses = new Map();
+          for (const a of all) for (const x of exes(a)) uses.set(x, (uses.get(x) || 0) + 1);
+          list = all.filter(a => a && a.icon_hash && a.name).map(a => [a.id, a.icon_hash, exes(a).filter(x => uses.get(x) === 1).join('|'), a.name, ...(a.aliases || [])]);
+          list = { v: 2, games: list };
           fs.writeFileSync(file, JSON.stringify(list));
         }
       } catch (e) { /* offline */ }
       if (!list) { try { list = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { list = []; } }
     }
-    const idx = new Map();
-    for (const [id, icon, ...names] of list) for (const n of names) { const k = flatName(n); if (k && !idx.has(k)) idx.set(k, { id, icon }); }
+    const idx = new Map(), exes = new Map();
+    // before 1.51.0 the file was a plain list without programs: [id, icon, ...names]
+    const rows = Array.isArray(list) ? list.map(([id, icon, ...names]) => [id, icon, '', ...names]) : (list && list.games) || [];
+    for (const [id, icon, ex, ...names] of rows) {
+      for (const n of names) { const k = flatName(n); if (k && !idx.has(k)) idx.set(k, { id, icon }); }
+      for (const x of String(ex || '').split('|')) if (x) exes.set(x, { id, icon });
+    }
+    idx.exes = exes;
     gameIndex = idx;
     return idx;
   })();
@@ -1686,8 +1710,8 @@ const iconJobs = new Map();
 async function gameIcon(name) {
   if (!name || /^(desktop|other)$/i.test(name)) return null;
   const idx = await loadGameIndex();
-  let hit = null;
-  for (const k of nameVariants(name)) { hit = idx.get(k); if (hit) break; }
+  let hit = groupApps.get(name) || null;
+  if (!hit) for (const k of nameVariants(name)) { hit = idx.get(k); if (hit) break; }
   if (!hit) return null;
   const file = path.join(iconDir(), `${hit.id}-${hit.icon}.png`);
   if (fs.existsSync(file)) return pathToFileURL(file).href;
